@@ -117,6 +117,7 @@ pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<Vec<Instrum
                 is_active:             true,
                 tick_size:             parse_filter_f64(s, "PRICE_FILTER", "tickSize"),
                 min_trade_amount:      parse_filter_f64(s, "LOT_SIZE", "minQty"),
+                qty_step:              Some(parse_filter_f64(s, "LOT_SIZE", "stepSize")).filter(|&v| v > 0.0),
                 contract_size:         Some(1.0),
                 option_type:           None,
                 strike:                None,

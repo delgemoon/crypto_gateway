@@ -14,6 +14,7 @@
 ///   - `ws://connection`      — payload: WsConnectionEvent
 
 pub mod binance;
+pub mod bullish;
 pub mod bybit;
 pub mod coincall;
 pub mod deribit;

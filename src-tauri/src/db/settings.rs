@@ -8,7 +8,8 @@ pub fn get_general(pool: &DbPool) -> Result<GeneralSettings, String> {
     let conn = pool.get().map_err(|e| e.to_string())?;
     let result = conn.query_row(
         "SELECT theme, default_currency, number_locale,
-                price_decimals, size_decimals, confirm_orders, watched_coins, bot_id
+                price_decimals, size_decimals, confirm_orders, watched_coins, bot_id,
+                book_emit_interval_ms
          FROM general_settings WHERE id = 1",
         [],
         |row| {
@@ -21,6 +22,7 @@ pub fn get_general(pool: &DbPool) -> Result<GeneralSettings, String> {
                 confirm_orders: row.get(5)?,
                 watched_coins: row.get::<_, Option<String>>(6)?.unwrap_or_default(),
                 bot_id: row.get::<_, Option<u16>>(7)?.unwrap_or(1),
+                book_emit_interval_ms: row.get::<_, Option<u32>>(8)?.unwrap_or(80),
             })
         },
     );
@@ -36,17 +38,19 @@ pub fn save_general(pool: &DbPool, s: &GeneralSettings) -> Result<(), String> {
     conn.execute(
         "INSERT INTO general_settings
              (id, theme, default_currency, number_locale,
-              price_decimals, size_decimals, confirm_orders, watched_coins, bot_id)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+              price_decimals, size_decimals, confirm_orders, watched_coins, bot_id,
+              book_emit_interval_ms)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(id) DO UPDATE SET
-             theme            = excluded.theme,
-             default_currency = excluded.default_currency,
-             number_locale    = excluded.number_locale,
-             price_decimals   = excluded.price_decimals,
-             size_decimals    = excluded.size_decimals,
-             confirm_orders   = excluded.confirm_orders,
-             watched_coins    = excluded.watched_coins,
-             bot_id           = excluded.bot_id",
+             theme                 = excluded.theme,
+             default_currency      = excluded.default_currency,
+             number_locale         = excluded.number_locale,
+             price_decimals        = excluded.price_decimals,
+             size_decimals         = excluded.size_decimals,
+             confirm_orders        = excluded.confirm_orders,
+             watched_coins         = excluded.watched_coins,
+             bot_id                = excluded.bot_id,
+             book_emit_interval_ms = excluded.book_emit_interval_ms",
         params![
             s.theme,
             s.default_currency,
@@ -56,6 +60,7 @@ pub fn save_general(pool: &DbPool, s: &GeneralSettings) -> Result<(), String> {
             s.confirm_orders,
             s.watched_coins,
             s.bot_id,
+            s.book_emit_interval_ms,
         ],
     )
     .map_err(|e| e.to_string())?;

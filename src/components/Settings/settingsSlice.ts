@@ -34,7 +34,7 @@ export interface ClientTelegramChat {
 export interface Account {
   id: string;
   name: string;
-  exchange: 'deribit' | 'okx' | 'bybit' | 'coincall' | 'binance' | 'mexc' | 'hyperliquid' | 'uniswap';
+  exchange: 'deribit' | 'okx' | 'bybit' | 'coincall' | 'binance' | 'mexc' | 'hyperliquid' | 'uniswap' | 'bullish';
   rpcUrl?: string;
   chainId?: number;
   apiKey: string;
@@ -63,6 +63,8 @@ export interface GeneralSettings {
   watchedCoins: string;
   /** Bot/instance ID encoded into client order IDs (default = 1) */
   botId: number;
+  /** How often the backend emits book/ticker events to the frontend (ms, default 80) */
+  bookEmitIntervalMs: number;
 }
 
 // ── Client Info ────────────────────────────────────────────────────────────
@@ -117,6 +119,7 @@ const initialState: SettingsState = {
     confirmOrders: true,
     watchedCoins: '',
     botId: 1,
+    bookEmitIntervalMs: 80,
   },
   client: {
     companyName: '',

@@ -133,6 +133,7 @@ pub async fn fetch_instruments(_currency: &str, _kind: &str) -> Result<Vec<Instr
             is_active:       true,
             tick_size:       asset["szDecimals"].as_f64().map(|d| 10f64.powi(-(d as i32))).unwrap_or(0.001),
             min_trade_amount: 0.001,
+            qty_step:        None,
             contract_size:   Some(1.0),
             option_type:     None,
             strike:          None,

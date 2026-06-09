@@ -91,16 +91,18 @@ async fn fetch_instruments(
     exchange: String,
     currency: String,
     kind: String,
+    testnet: Option<bool>,
 ) -> Result<Vec<Instrument>, String> {
-    dispatch::fetch_instruments(&exchange, &currency, &kind).await
+    dispatch::fetch_instruments(&exchange, &currency, &kind, testnet.unwrap_or(false)).await
 }
 
 #[tauri::command]
 async fn fetch_ticker(
     exchange: String,
     instrument_name: String,
+    testnet: Option<bool>,
 ) -> Result<Ticker, String> {
-    dispatch::fetch_ticker(&exchange, &instrument_name).await
+    dispatch::fetch_ticker(&exchange, &instrument_name, testnet.unwrap_or(false)).await
 }
 
 // ── Order Commands ─────────────────────────────────────────────────────────
@@ -383,6 +385,17 @@ async fn ws_connect(
                 }
             });
             tauri::async_runtime::spawn(ws::hyperliquid::run(app, account_id, wallet, testnet, status_tx));
+        }
+        "bullish" => {
+            let trading_account_id = account.passphrase.clone().unwrap_or_default();
+            ws::bullish::spawn(
+                app,
+                state.ws_manager.clone(),
+                account.id,
+                account.api_key,
+                account.api_secret,
+                trading_account_id,
+            );
         }
         ex => return Err(format!("WebSocket not yet supported for {}", ex)),
     }
@@ -890,8 +903,9 @@ async fn fetch_reference_data(
     exchange: String,
     currency: String,
     kind: String,
+    testnet: Option<bool>,
 ) -> Result<Vec<ReferenceData>, String> {
-    dispatch::fetch_reference_data(&exchange, &currency, &kind).await
+    dispatch::fetch_reference_data(&exchange, &currency, &kind, testnet.unwrap_or(false)).await
 }
 
 // ── Market Data Subscriptions ──────────────────────────────────────────────
@@ -916,7 +930,12 @@ async fn subscribe_market_data(
         None
     };
 
-    state.market_manager.subscribe(app, exchange, exchange_symbol, symbol, kind, ws_url).await;
+    let emit_interval_ms = db::settings::get_general(&state.pool)
+        .unwrap_or_default()
+        .book_emit_interval_ms
+        .max(10); // floor at 10ms to prevent accidental 0 freeze
+
+    state.market_manager.subscribe(app, exchange, exchange_symbol, symbol, kind, ws_url, emit_interval_ms).await;
     Ok(())
 }
 

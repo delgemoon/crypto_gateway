@@ -255,7 +255,7 @@ impl AggBookManager {
             let mut instrument_map: Vec<(String, String, String, bool)> = Vec::new();
 
             for account in &relevant {
-                match dispatch::fetch_instruments(&account.exchange, &config.base_symbol, kind).await {
+                match dispatch::fetch_instruments(&account.exchange, &config.base_symbol, kind, account.testnet).await {
                     Ok(instruments) => {
                         for inst in &instruments {
                             if is_matching_instrument(inst, &config) {
@@ -317,10 +317,11 @@ impl AggBookManager {
                     // REST fallback: spawn a polling task that writes to watch
                     let inst = instrument.clone();
                     let ex = exchange.clone();
+                    let tn = *testnet;
                     let depth = max_levels as u32;
                     let h = tauri::async_runtime::spawn(async move {
                         loop {
-                            match dispatch::fetch_orderbook(&ex, &inst, depth).await {
+                            match dispatch::fetch_orderbook(&ex, &inst, depth, tn).await {
                                 Ok(snap) => { let _ = tx.send(Some(snap)); }
                                 Err(e)   => { eprintln!("[agg_book] REST poll error {}: {}", ex, e); }
                             }

@@ -88,6 +88,7 @@ pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<Vec<Instrum
             is_active:           true,
             tick_size:           parse_str_f64(&i["tickSz"], 0.01),
             min_trade_amount:    parse_str_f64(&i["minSz"], 1.0),
+            qty_step:            { let v = parse_str_f64(&i["lotSz"], 0.0); if v > 0.0 { Some(v) } else { None } },
             contract_size:       i["ctVal"].as_str().and_then(|s| s.parse().ok()),
             option_type:         non_empty_str(&i["optType"]),
             strike:              i["stk"].as_str().and_then(|s| s.parse().ok()),

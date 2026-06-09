@@ -28,7 +28,7 @@ import {
 // ── Types & constants ──────────────────────────────────────────────────────
 
 type SettingsTab = 'general' | 'exchange' | 'client' | 'telegram' | 'tags' | 'venue' | 'aggbook';
-const EXCHANGES = ['deribit', 'okx', 'bybit', 'coincall', 'binance', 'mexc', 'hyperliquid', 'uniswap'] as const;
+const EXCHANGES = ['deribit', 'okx', 'bybit', 'coincall', 'binance', 'mexc', 'hyperliquid', 'uniswap', 'bullish'] as const;
 const TIF_OPTIONS = [
   { value: 'good_til_cancelled', label: 'GTC — Good Till Cancelled' },
   { value: 'immediate_or_cancel', label: 'IOC — Immediate or Cancel' },
@@ -57,6 +57,7 @@ function tierOrderRps(exchange: string, tier: string): string {
     mexc:         { tier1:  5, tier2: 10, vip1: 20, vip2:  30, vip3:  50, vip4:  75, vip5: 100, market_maker: 150  },
     hyperliquid:  { tier1:  5, tier2: 10, vip1: 15, vip2:  15, vip3:  15, vip4:  15, vip5:  15, market_maker: 100  },
     uniswap:      { tier1:  2, tier2:  2, vip1:  2, vip2:   2, vip3:   2, vip4:   2, vip5:   2, market_maker:   2  },
+    bullish:      { tier1: 10, tier2: 20, vip1: 40, vip2:  60, vip3: 100, vip4: 150, vip5: 200, market_maker: 300  },
   };
   const rps = table[exchange]?.[tier] ?? 10;
   return `${rps} orders/s`;
@@ -172,7 +173,35 @@ const GeneralTab: FunctionComponent = () => {
       </SectionCard>
 
       <SectionCard>
-        <SectionHeader><h3>Account Summary — Watched Coins</h3></SectionHeader>
+        <SectionHeader><h3>Market Data Performance</h3></SectionHeader>
+        <SectionBody>
+          <p style={{ fontSize: '0.8rem', color: '#7e8b99', marginBottom: '0.75rem' }}>
+            Controls how often the backend pushes orderbook updates to the UI.
+            Lower = more real-time; higher = less CPU/memory pressure. Takes effect on next instrument subscription.
+          </p>
+          <FormGrid>
+            <FormGroup>
+              <Label>Book Emit Interval (ms)</Label>
+              <Select
+                value={general.bookEmitIntervalMs ?? 80}
+                onChange={(e) => update({ bookEmitIntervalMs: Number(e.target.value) })}
+              >
+                <option value={20}>20ms — Ultra fast (high CPU)</option>
+                <option value={50}>50ms — Fast</option>
+                <option value={80}>80ms — Default (recommended)</option>
+                <option value={150}>150ms — Smooth</option>
+                <option value={250}>250ms — Low resource</option>
+                <option value={500}>500ms — Minimal (very slow machines)</option>
+              </Select>
+            </FormGroup>
+          </FormGrid>
+          <div style={{ fontSize: '0.75rem', color: '#4a5568', marginTop: '0.5rem' }}>
+            At 80ms the book updates ~12×/sec. The backend always keeps a full book in memory regardless of this setting.
+          </div>
+        </SectionBody>
+      </SectionCard>
+
+      <SectionCard>
         <SectionBody>
           <p style={{ fontSize: '0.8rem', color: '#7e8b99', marginBottom: '0.75rem' }}>
             Select which coins to show in the Account Summary panel. Leave all deselected to show all coins (may use more memory).
@@ -390,6 +419,13 @@ const ExchangeTab: FunctionComponent = () => {
                   <FormGroup $span={2}>
                     <Label>Passphrase <span style={{ color: '#d0616e' }}>*</span> (OKX required)</Label>
                     <Input type="password" value={form.passphrase ?? ''} placeholder="Your OKX API passphrase"
+                      onChange={(e) => upd({ passphrase: e.target.value })} />
+                  </FormGroup>
+                )}
+                {form.exchange === 'bullish' && (
+                  <FormGroup $span={2}>
+                    <Label>Trading Account ID <span style={{ color: '#aaa' }}>(optional — fetched automatically)</span></Label>
+                    <Input value={form.passphrase ?? ''} placeholder="Leave blank to auto-detect from API"
                       onChange={(e) => upd({ passphrase: e.target.value })} />
                   </FormGroup>
                 )}

@@ -24,6 +24,7 @@ export interface VenueRef {
   exchangeSymbol: string;
   tickSize: number;
   minTradeAmount: number;
+  qtyStep: number;
   contractSize?: number;
   settlementCurrency: string;
 }

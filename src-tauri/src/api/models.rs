@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct Account {
     pub id: String,
     pub name: String,
-    /// "deribit" | "okx" | "bybit" | "coincall" | "binance" | "mexc" | "hyperliquid" | "uniswap"
+    /// "deribit" | "okx" | "bybit" | "coincall" | "binance" | "mexc" | "hyperliquid" | "uniswap" | "bullish"
     pub exchange: String,
     /// CeFi: API key  |  DeFi: wallet address (public)
     pub api_key: String,
@@ -65,6 +65,10 @@ pub struct GeneralSettings {
     /// Bot/instance ID encoded into client order IDs (default = 1)
     #[serde(default = "default_bot_id")]
     pub bot_id: u16,
+    /// How often the Rust backend emits book/ticker events to the frontend (ms).
+    /// Lower = more responsive; higher = less CPU/memory pressure. Default: 80ms.
+    #[serde(default = "default_book_emit_interval_ms")]
+    pub book_emit_interval_ms: u32,
 }
 
 fn default_theme() -> String { "dark".to_string() }
@@ -74,6 +78,7 @@ fn default_price_decimals() -> i32 { 2 }
 fn default_size_decimals() -> i32 { 4 }
 fn default_confirm_orders() -> bool { true }
 fn default_bot_id() -> u16 { 1 }
+fn default_book_emit_interval_ms() -> u32 { 80 }
 
 impl Default for GeneralSettings {
     fn default() -> Self {
@@ -86,6 +91,7 @@ impl Default for GeneralSettings {
             confirm_orders: default_confirm_orders(),
             watched_coins: String::new(),
             bot_id: default_bot_id(),
+            book_emit_interval_ms: default_book_emit_interval_ms(),
         }
     }
 }
@@ -212,6 +218,9 @@ pub struct Instrument {
     pub is_active: bool,
     pub tick_size: f64,
     pub min_trade_amount: f64,
+    /// Quantity increment (lot/step size). Falls back to min_trade_amount when None.
+    #[serde(default)]
+    pub qty_step: Option<f64>,
     pub contract_size: Option<f64>,
     pub option_type: Option<String>,
     pub strike: Option<f64>,
@@ -445,6 +454,8 @@ pub struct VenueRef {
     pub exchange_symbol: String,
     pub tick_size: f64,
     pub min_trade_amount: f64,
+    /// Quantity increment (lot/step size). Always ≥ min_trade_amount.
+    pub qty_step: f64,
     pub contract_size: Option<f64>,
     pub settlement_currency: String,
 }
@@ -547,10 +558,10 @@ pub fn instrument_to_ref(exchange: &str, inst: &Instrument) -> ReferenceData {
         _ => "future",
     };
 
-    let expiry = if kind == "future" {
-        inst.expiration_timestamp.map(ts_ms_to_date)
-    } else {
-        None
+    // Options also need expiry for correct canonical symbols and cascade filtering.
+    let expiry = match kind {
+        "future" | "option" => inst.expiration_timestamp.map(ts_ms_to_date),
+        _ => None,
     };
 
     let opt_type = inst.option_type.as_deref().and_then(norm_option_type);
@@ -564,6 +575,7 @@ pub fn instrument_to_ref(exchange: &str, inst: &Instrument) -> ReferenceData {
         exchange_symbol: inst.instrument_name.clone(),
         tick_size: inst.tick_size,
         min_trade_amount: inst.min_trade_amount,
+        qty_step: inst.qty_step.unwrap_or(inst.min_trade_amount),
         contract_size: inst.contract_size,
         settlement_currency: inst.settlement_currency.to_uppercase(),
     };

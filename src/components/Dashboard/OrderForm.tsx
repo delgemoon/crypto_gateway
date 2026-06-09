@@ -311,6 +311,28 @@ const TYPE_LABELS: Record<OrderType, string> = {
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+/**
+ * Round a price to the nearest tick boundary.
+ * e.g. tickSize=0.5, price=100.3 → 100.5
+ */
+function roundToTick(value: number, tickSize: number): number {
+  if (!tickSize || tickSize <= 0) return value;
+  const precision = Math.round(-Math.log10(tickSize));
+  const factor = Math.pow(10, precision);
+  return Math.round(Math.round(value / tickSize) * tickSize * factor) / factor;
+}
+
+/**
+ * Floor a quantity to the nearest step boundary.
+ * e.g. stepSize=10, qty=15 → 10
+ */
+function floorToStep(value: number, stepSize: number): number {
+  if (!stepSize || stepSize <= 0) return value;
+  const precision = Math.round(-Math.log10(stepSize));
+  const factor = Math.pow(10, precision);
+  return Math.floor(Math.round(value / stepSize) * stepSize * factor) / factor;
+}
+
 // ── Component ──────────────────────────────────────────────────────────────
 
 const OrderForm: FunctionComponent = () => {
@@ -382,6 +404,7 @@ const OrderForm: FunctionComponent = () => {
         exchange: activeAccount.exchange,
         currency: baseCurrency,
         kind: 'future',
+        testnet: activeAccount.testnet ?? false,
       })
         .then((list) => {
           setHedgeInstruments(list);
@@ -405,7 +428,10 @@ const OrderForm: FunctionComponent = () => {
     wsStatus === 'reconnecting' ? 'Reconnecting…' :
     wsStatus === 'error'        ? 'WS Error' :
     'WS Offline';
-  const minAmount = currentRef?.venues.find(v => v.exchange === (activeAccount?.exchange ?? ''))?.minTradeAmount ?? 1;
+  const activeVenue = currentRef?.venues.find(v => v.exchange === (activeAccount?.exchange ?? ''));
+  const minAmount = activeVenue?.minTradeAmount ?? 1;
+  const tickSize  = activeVenue?.tickSize  ?? 0.01;
+  const qtyStep   = activeVenue?.qtyStep   ?? minAmount;
   const showPrice = ['limit', 'limit_post', 'stop_limit', 'stop_market', 'smart_post', 'smart_hedge'].includes(orderType);
   const showTif   = ['limit', 'limit_post', 'stop_limit'].includes(orderType);
   const isSmartType = ['smart_post', 'hedge', 'smart_hedge'].includes(orderType);
@@ -477,6 +503,7 @@ const OrderForm: FunctionComponent = () => {
     const ticker = await invoke<any>('fetch_ticker', {
       exchange: activeAccount?.exchange ?? '',
       instrumentName: instrName,
+      testnet: activeAccount?.testnet ?? false,
     }).catch(() => null);
     if (!ticker) return null;
     return side === 'buy'
@@ -671,14 +698,18 @@ const OrderForm: FunctionComponent = () => {
     dispatch(setLastOrderResult(null));
     try {
       const isPost = orderType === 'limit_post';
+      const rawQty = parseFloat(amount);
+      const rawPrice = showPrice && price ? parseFloat(price) : null;
+      const quantizedQty   = floorToStep(Math.max(rawQty, minAmount), qtyStep);
+      const quantizedPrice = rawPrice != null ? roundToTick(rawPrice, tickSize) : null;
       const result = await invoke<any>('place_order', {
         req: {
           account_id: activeAccountId,
           instrument_name: exchangeSymbol,
           side,
           order_type: isPost ? 'limit' : orderType,
-          amount: parseFloat(amount),
-          price: showPrice && price ? parseFloat(price) : null,
+          amount: quantizedQty,
+          price: quantizedPrice,
           time_in_force: tif,
           post_only: isPost,
           label: null,
@@ -783,10 +814,14 @@ const OrderForm: FunctionComponent = () => {
           {/* ── Price (standard types) ── */}
           {showPrice && orderType !== 'smart_post' && orderType !== 'smart_hedge' && (
             <Row>
-              <FieldLabel>Price (USD)</FieldLabel>
+              <FieldLabel>Price <span style={{ color: '#4a5568', fontSize: '0.7em' }}>tick {tickSize}</span></FieldLabel>
               <FieldInput
-                type="number" step="any" placeholder="0.00"
+                type="number" step={tickSize} placeholder="0.00"
                 value={price} onChange={(e) => setPrice(e.target.value)}
+                onBlur={(e) => {
+                  const v = parseFloat(e.target.value);
+                  if (!isNaN(v)) setPrice(String(roundToTick(v, tickSize)));
+                }}
                 required={showPrice}
               />
             </Row>
@@ -795,11 +830,16 @@ const OrderForm: FunctionComponent = () => {
           {/* ── Amount (non-hedge types) ── */}
           {orderType !== 'hedge' && (
             <Row>
-              <FieldLabel>Amount (min {minAmount})</FieldLabel>
+              <FieldLabel>Amount <span style={{ color: '#4a5568', fontSize: '0.7em' }}>min {minAmount} · step {qtyStep}</span></FieldLabel>
               <FieldInput
-                type="number" step="any" min={minAmount}
+                type="number" step={qtyStep} min={minAmount}
                 placeholder={String(minAmount)} value={amount}
-                onChange={(e) => setAmount(e.target.value)} required
+                onChange={(e) => setAmount(e.target.value)}
+                onBlur={(e) => {
+                  const v = parseFloat(e.target.value);
+                  if (!isNaN(v)) setAmount(String(floorToStep(Math.max(v, minAmount), qtyStep)));
+                }}
+                required
               />
             </Row>
           )}

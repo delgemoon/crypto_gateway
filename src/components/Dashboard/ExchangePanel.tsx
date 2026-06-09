@@ -544,17 +544,24 @@ const OrderBookPanel: FunctionComponent<OBPanelProps> = memo(({
     pendingBidsRef.current = new Map(); pendingAsksRef.current = new Map();
     pendingTickerRef.current = null; bookDirtyRef.current = false; tickerDirtyRef.current = false;
 
+    console.log('[market] subscribing', { exchange: account.exchange, exchangeSymbol, symbol, kind });
     invoke('subscribe_market_data', {
       exchange: account.exchange,
       exchangeSymbol,
       symbol,
       kind,
       accountId: account.exchange === 'coincall' ? account.id : undefined,
-    }).then(() => { if (!cancelled) onConnectedChange(true); }).catch(console.error);
+    }).then(() => {
+      console.log('[market] subscribed OK', exchangeSymbol);
+      if (!cancelled) onConnectedChange(true);
+    }).catch(e => {
+      console.error('[market] subscribe failed', e);
+    });
 
     listen<MarketBookEvent>('market://book', (event) => {
       const e = event.payload;
       if (e.symbol !== symbol || e.exchange !== account.exchange) return;
+      console.log('[market] book event', e.exchange, e.symbol, e.bids.length, 'bids', e.asks.length, 'asks');
       const bm = new Map<number, number>();
       const am = new Map<number, number>();
       for (const [p, s] of e.bids) bm.set(p, s);
@@ -887,7 +894,7 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
     setQuote('USD');
     setSelExpiryKey('PERP');
     setStrike(0);
-    invoke<ReferenceData[]>('fetch_reference_data', { exchange: account.exchange, currency: baseCcy, kind })
+    invoke<ReferenceData[]>('fetch_reference_data', { exchange: account.exchange, currency: baseCcy, kind, testnet: account.testnet ?? false })
       .then(list => {
         const sorted = [...list].sort((a, b) => a.symbol.localeCompare(b.symbol));
         instrumentCacheRef.current.set(cacheKey, sorted);

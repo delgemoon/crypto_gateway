@@ -6,10 +6,11 @@
 /// We spawn two connections — one for `options` and one for `futures` — so that
 /// order/trade/position events from both instrument types are received.
 ///
-/// After connecting we subscribe via:
-///   `{"action": "subscribe", "args": ["order", "trade", "position"]}`
+/// Subscription (each channel separately, using `dataType`):
+///   Options:  order(dt:11)  trade(dt:15)  position(dt:12)  positionEvent(dt:27)
+///   Futures:  order(dt:35)  trade(dt:38)
 ///
-/// Heartbeat: send `{"action":"ping"}` every 20s.
+/// Heartbeat: send `{"action":"heartbeat"}` every 15s; expect `{"c":11,"rc":1}`.
 /// Auto-reconnects with exponential backoff (1s → 2s → 4s … capped at 60s).
 
 use std::sync::Arc;
@@ -32,7 +33,7 @@ use crate::ws::{
 type HmacSha256 = Hmac<Sha256>;
 
 const WS_BASE: &str      = "wss://ws.coincall.com";
-const WS_TEST_BASE: &str = "wss://ws-test.coincall.com";
+const WS_TEST_BASE: &str = "wss://betaws.seizeyouralpha.com";
 const RECONNECT_MAX_DELAY_S: u64 = 60;
 
 fn now_ms() -> u64 {
@@ -45,11 +46,16 @@ fn build_url(base: &str, channel: &str, api_key: &str, api_secret: &str) -> Stri
     let mut mac = HmacSha256::new_from_slice(api_secret.as_bytes()).unwrap();
     mac.update(prehash.as_bytes());
     let sign = hex::encode(mac.finalize().into_bytes()).to_uppercase();
-    format!("{}/{}?code=10&uuid={}&ts={}&sign={}&apiKey={}", base, channel, api_key, ts, sign, api_key)
+    // Spot endpoint has an extra /ws path segment; options and futures do not.
+    if channel == "spot" {
+        format!("{}/{}/ws?code=10&uuid={}&ts={}&sign={}&apiKey={}", base, channel, api_key, ts, sign, api_key)
+    } else {
+        format!("{}/{}?code=10&uuid={}&ts={}&sign={}&apiKey={}", base, channel, api_key, ts, sign, api_key)
+    }
 }
 
-/// Spawn two background tasks: one for options WS, one for futures WS.
-/// Each gets its own WsHandle keyed by `{account_id}_options` / `{account_id}_futures`.
+/// Spawn three background tasks: options, futures, and spot private WS.
+/// Each gets its own WsHandle keyed by `{account_id}_options` / `{account_id}_futures` / `{account_id}_spot`.
 pub fn spawn(
     app: AppHandle,
     manager: Arc<WsManager>,
@@ -58,7 +64,7 @@ pub fn spawn(
     api_secret: String,
     testnet: bool,
 ) {
-    for channel in &["options", "futures"] {
+    for channel in &["options", "futures", "spot"] {
         let handle_id = format!("{}_{}", account_id, channel);
         let (cmd_tx, cmd_rx) = mpsc::channel::<WsCommand>(8);
         manager.register(WsHandle {
@@ -144,7 +150,7 @@ async fn handle_session(
     _manager: &Arc<WsManager>,
     handle_id: &str,
     account_id: &str,
-    _channel: &str,
+    channel: &str,
     ws_stream: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>
     >,
@@ -152,19 +158,26 @@ async fn handle_session(
 ) -> bool {
     let (mut sink, mut stream) = ws_stream.split();
 
-    // Auth is in the URL — subscribe immediately
-    let sub_msg = json!({
-        "action": "subscribe",
-        "args": ["order", "trade", "position"]
-    });
-    if sink.send(Message::Text(sub_msg.to_string().into())).await.is_err() {
-        return true;
-    }
-    eprintln!("[coincall_ws][{}] subscribed to order/trade/position", handle_id);
+    // Subscribe to each private channel separately using CoInCall's dataType format.
+    // Options WS: order(dt:11), trade(dt:15), position(dt:12), positionEvent(dt:27)
+    // Futures WS: order(dt:35), trade(dt:38)
+    // Spot WS:    order(dt:35), trade(dt:38)  (same dt codes as futures on spot endpoint)
+    let sub_channels: &[&str] = match channel {
+        "options" => &["order", "trade", "position", "positionEvent"],
+        _         => &["order", "trade"],  // futures + spot
+    };
 
-    // ── Heartbeat ping every 20s ────────────────────────────────────────
-    let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
-    ping_interval.tick().await;
+    for ch in sub_channels {
+        let msg = json!({ "action": "subscribe", "dataType": ch });
+        if sink.send(Message::Text(msg.to_string().into())).await.is_err() {
+            return true;
+        }
+    }
+    eprintln!("[coincall_ws][{}] subscribed {:?}", handle_id, sub_channels);
+
+    // ── Heartbeat every 15s ─────────────────────────────────────────────────
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.tick().await;
 
     loop {
         tokio::select! {
@@ -176,7 +189,9 @@ async fn handle_session(
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        dispatch_message(app, account_id, &v);
+                        // Ignore subscription ack / heartbeat responses (contain "rc" field)
+                        if v["rc"].is_number() { continue; }
+                        dispatch_message(app, account_id, channel == "options", &v);
                     }
                     Some(Ok(Message::Ping(data))) => {
                         let _ = sink.send(Message::Pong(data)).await;
@@ -185,8 +200,8 @@ async fn handle_session(
                     _ => {}
                 }
             }
-            _ = ping_interval.tick() => {
-                let ping = json!({"action": "ping"});
+            _ = heartbeat.tick() => {
+                let ping = json!({"action": "heartbeat"});
                 if sink.send(Message::Text(ping.to_string().into())).await.is_err() {
                     return true;
                 }
@@ -203,144 +218,224 @@ async fn handle_session(
     }
 }
 
-fn dispatch_message(app: &AppHandle, account_id: &str, v: &Value) {
-    let topic = v["topic"].as_str()
-        .or_else(|| v["action"].as_str())
-        .unwrap_or("");
+// ── CoInCall dt code constants ─────────────────────────────────────────────
+// Options WS
+const DT_OPT_ORDER:    i64 = 11;
+const DT_OPT_TRADE:    i64 = 15;
+const DT_OPT_POSITION: i64 = 12;
+const DT_OPT_POS_EVT:  i64 = 27;
+// Futures WS
+const DT_FUT_ORDER:    i64 = 35;
+const DT_FUT_TRADE:    i64 = 38;
 
-    match topic {
-        "order" => {
-            if let Some(arr) = v["data"].as_array() {
-                for o in arr {
-                    if let Some(order) = parse_order_update(account_id, o) {
-                        let _ = app.emit("ws://order_update", &order);
-                    }
-                }
-            } else if v["data"].is_object() {
-                if let Some(order) = parse_order_update(account_id, &v["data"]) {
+fn dispatch_message(app: &AppHandle, account_id: &str, is_options: bool, v: &Value) {
+    let dt = match v["dt"].as_i64() { Some(d) => d, None => return };
+    let data = &v["d"];
+
+    if is_options {
+        match dt {
+            DT_OPT_ORDER => {
+                if let Some(order) = parse_order_update(account_id, data) {
                     let _ = app.emit("ws://order_update", &order);
                 }
             }
-        }
-        "trade" => {
-            if let Some(arr) = v["data"].as_array() {
-                for t in arr {
-                    if let Some(trade) = parse_trade_update(account_id, t) {
-                        let _ = app.emit("ws://trade_update", &trade);
-                    }
-                }
-            } else if v["data"].is_object() {
-                if let Some(trade) = parse_trade_update(account_id, &v["data"]) {
+            DT_OPT_TRADE => {
+                if let Some(trade) = parse_options_trade_update(account_id, data) {
                     let _ = app.emit("ws://trade_update", &trade);
                 }
             }
-        }
-        "position" => {
-            if let Some(arr) = v["data"].as_array() {
-                for p in arr {
-                    if let Some(pos) = parse_position_update(account_id, p) {
-                        let _ = app.emit("ws://position_update", &pos);
-                    }
-                }
-            } else if v["data"].is_object() {
-                if let Some(pos) = parse_position_update(account_id, &v["data"]) {
+            DT_OPT_POSITION | DT_OPT_POS_EVT => {
+                if let Some(pos) = parse_options_position_update(account_id, data) {
                     let _ = app.emit("ws://position_update", &pos);
                 }
             }
+            _ => {}
         }
-        _ => {}
+    } else {
+        match dt {
+            DT_FUT_ORDER => {
+                if let Some(order) = parse_order_update(account_id, data) {
+                    let _ = app.emit("ws://order_update", &order);
+                }
+            }
+            DT_FUT_TRADE => {
+                if let Some(trade) = parse_futures_trade_update(account_id, data) {
+                    let _ = app.emit("ws://trade_update", &trade);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
+// ── Parse helpers ──────────────────────────────────────────────────────────
+
+/// Parse a value that CoInCall may send as either number or numeric string.
+fn parse_f64(v: &Value) -> Option<f64> {
+    v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+}
+
+fn parse_str(v: &Value) -> Option<String> {
+    v.as_str().map(|s| s.to_string())
+        .or_else(|| v.as_i64().map(|n| n.to_string()))
+        .or_else(|| v.as_u64().map(|n| n.to_string()))
+}
+
+/// Map CoInCall numeric `os` order status to canonical string.
+fn map_order_state(os: i64) -> &'static str {
+    match os {
+        0  => "open",       // NEW
+        1  => "filled",     // FILLED
+        2  => "open",       // PARTIALLY_FILLED (still open)
+        3  => "cancelled",  // CANCELED
+        4  => "cancelled",  // PRE_CANCEL
+        5  => "cancelled",  // CANCELING
+        6  => "rejected",   // INVALID
+        10 => "filled",     // CANCEL_BY_EXERCISE
+        _  => "unknown",
+    }
+}
+
+/// Map CoInCall numeric `ty` trade type to string.
+fn map_order_type(ty: i64) -> &'static str {
+    match ty {
+        1  => "limit",
+        2  => "market",
+        3  => "limit",     // POST_ONLY
+        4  => "stop_limit",
+        5  => "stop_market",
+        14 => "block_trade",
+        _  => "limit",
+    }
+}
+
+/// Parse an order update from either options(dt:11) or futures(dt:35).
+/// Both use abbreviated field names in the `d` object.
 fn parse_order_update(account_id: &str, o: &Value) -> Option<WsOrderUpdate> {
-    let order_id = o["orderId"].as_str()
-        .or_else(|| o["id"].as_str())
-        .or_else(|| o["order_id"].as_str())?
-        .to_string();
-
-    let state_raw = o["orderStatus"].as_str()
-        .or_else(|| o["status"].as_str())
-        .unwrap_or("");
-    let state = match state_raw {
-        "0" | "open"     => "open",
-        "1" | "partial"  => "open",
-        "2" | "filled"   => "filled",
-        "3" | "cancelled"| "canceled" => "cancelled",
-        "4" | "rejected" => "rejected",
-        other            => other,
+    let order_id = parse_str(&o["oid"])?;
+    let symbol = parse_str(&o["s"]).unwrap_or_default();
+    let si = o["si"].as_i64().unwrap_or(1);
+    let direction = if si == 1 { "buy" } else { "sell" };
+    let os = o["os"].as_i64()
+        .or_else(|| o["os"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(0);
+    let ty = o["ty"].as_i64().unwrap_or(1);
+    let tif = match o["tif"].as_i64().unwrap_or(0) {
+        0 => "good_til_cancelled",
+        1 => "good_til_cancelled", // POST_ONLY
+        2 => "immediate_or_cancel",
+        3 => "fill_or_kill",
+        _ => "good_til_cancelled",
     };
-
-    let side_raw = o["side"].as_i64().unwrap_or(
-        o["side"].as_str().map(|s| if s == "buy" || s == "1" { 1 } else { -1 }).unwrap_or(1)
-    );
-    let direction = if side_raw == 1 { "buy" } else { "sell" };
+    let amount = parse_f64(&o["q"]).unwrap_or(0.0);
+    let filled = parse_f64(&o["fq"]).unwrap_or(0.0);
+    let price  = parse_f64(&o["pr"]);
+    let ts = o["ts"].as_i64().or_else(|| o["ct"].as_i64()).unwrap_or(0);
+    let client_order_id = parse_str(&o["coid"]);
 
     Some(WsOrderUpdate {
         account_id:      account_id.to_string(),
         exchange:        "coincall".to_string(),
         order_id,
-        instrument_name: o["symbol"].as_str().unwrap_or("").to_string(),
+        instrument_name: symbol,
         direction:       direction.to_string(),
-        order_type:      o["orderType"].as_str().unwrap_or("").to_lowercase(),
-        order_state:     state.to_string(),
-        price:           o["price"].as_f64().or_else(|| o["price"].as_str().and_then(|s| s.parse().ok())),
-        amount:          o["qty"].as_f64().or_else(|| o["quantity"].as_f64()).unwrap_or(0.0),
-        filled_amount:   o["filledQty"].as_f64().unwrap_or(0.0),
-        time_in_force:   o["timeInForce"].as_str().unwrap_or("").to_string(),
-        label:           o["clientOrderId"].as_str().map(|s| s.to_string()),
-        client_order_id: o["clientOrderId"].as_str().map(|s| s.to_string()),
-        timestamp:       o["updateTime"].as_i64().or_else(|| o["ts"].as_i64()).unwrap_or(0),
+        order_type:      map_order_type(ty).to_string(),
+        order_state:     map_order_state(os).to_string(),
+        price,
+        amount,
+        filled_amount:   filled,
+        time_in_force:   tif.to_string(),
+        label:           client_order_id.clone(),
+        client_order_id,
+        timestamp: ts,
     })
 }
 
-fn parse_trade_update(account_id: &str, t: &Value) -> Option<WsTradeUpdate> {
-    let trade_id = t["tradeId"].as_str()
-        .or_else(|| t["id"].as_str())
-        .or_else(|| t["trade_id"].as_str())?
-        .to_string();
-
-    let side_raw = t["side"].as_i64().unwrap_or(
-        t["side"].as_str().map(|s| if s == "buy" || s == "1" { 1 } else { -1 }).unwrap_or(1)
-    );
-    let direction = if side_raw == 1 { "buy" } else { "sell" };
+/// Parse a trade update from options WS (dt:15).
+/// Options trades use full camelCase field names.
+fn parse_options_trade_update(account_id: &str, t: &Value) -> Option<WsTradeUpdate> {
+    let trade_id = parse_str(&t["tradeId"])?;
+    let order_id = parse_str(&t["orderId"]).unwrap_or_default();
+    let symbol   = parse_str(&t["symbol"]).unwrap_or_default();
+    let side_raw = t["orderSide"].as_str().unwrap_or("1");
+    let direction = if side_raw == "1" { "buy" } else { "sell" };
+    let price  = parse_f64(&t["matchPrice"]).unwrap_or(0.0);
+    let amount = parse_f64(&t["matchQty"]).unwrap_or(0.0);
+    let fee_rate = parse_f64(&t["feeRate"]).unwrap_or(0.0);
+    let fee = price * amount * fee_rate.abs();
+    let ts = parse_f64(&t["tradeTime"]).unwrap_or(0.0) as i64;
+    let client_order_id = parse_str(&t["clientOrderId"]);
 
     Some(WsTradeUpdate {
         account_id:      account_id.to_string(),
         exchange:        "coincall".to_string(),
         trade_id,
-        order_id:        t["orderId"].as_str().unwrap_or("").to_string(),
-        instrument_name: t["symbol"].as_str().unwrap_or("").to_string(),
+        order_id,
+        instrument_name: symbol,
         direction:       direction.to_string(),
-        amount:          t["qty"].as_f64().or_else(|| t["quantity"].as_f64()).unwrap_or(0.0),
-        price:           t["price"].as_f64().or_else(|| t["price"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0),
-        fee:             t["fee"].as_f64().unwrap_or(0.0),
-        fee_currency:    t["feeCurrency"].as_str().unwrap_or("USDT").to_string(),
-        timestamp:       t["createTime"].as_i64().or_else(|| t["ts"].as_i64()).unwrap_or(0),
-        client_order_id: t["clientOrderId"].as_str().map(|s| s.to_string()),
+        amount,
+        price,
+        fee,
+        fee_currency:    "USDT".to_string(),
+        timestamp: ts,
+        client_order_id,
     })
 }
 
-fn parse_position_update(account_id: &str, p: &Value) -> Option<WsPositionUpdate> {
-    let inst = p["symbol"].as_str()?;
-    let side_raw = p["side"].as_i64().unwrap_or(
-        p["side"].as_str().map(|s| if s == "1" { 1 } else { -1 }).unwrap_or(1)
-    );
-    let direction = if side_raw == 1 { "buy" } else { "sell" };
-    let size = p["qty"].as_f64().or_else(|| p["quantity"].as_f64()).unwrap_or(0.0);
+/// Parse a trade update from futures WS (dt:38).
+/// Futures trades use abbreviated field names.
+fn parse_futures_trade_update(account_id: &str, t: &Value) -> Option<WsTradeUpdate> {
+    let trade_id = parse_str(&t["tid"])?;
+    let order_id = parse_str(&t["oid"]).unwrap_or_default();
+    let symbol   = parse_str(&t["s"]).unwrap_or_default();
+    let si = t["si"].as_i64().or_else(|| t["si"].as_str().and_then(|s| s.parse().ok())).unwrap_or(1);
+    let direction = if si == 1 { "buy" } else { "sell" };
+    let price  = parse_f64(&t["mpr"]).unwrap_or(0.0);
+    let amount = parse_f64(&t["mq"]).unwrap_or(0.0);
+    let fee_rate = parse_f64(&t["fr"]).unwrap_or(0.0);
+    let fee = price * amount * fee_rate.abs();
+    let ts = t["ct"].as_i64().or_else(|| t["ts"].as_i64()).unwrap_or(0);
+    let client_order_id = parse_str(&t["coid"]);
+
+    Some(WsTradeUpdate {
+        account_id:      account_id.to_string(),
+        exchange:        "coincall".to_string(),
+        trade_id,
+        order_id,
+        instrument_name: symbol,
+        direction:       direction.to_string(),
+        amount,
+        price,
+        fee,
+        fee_currency:    "USDT".to_string(),
+        timestamp: ts,
+        client_order_id,
+    })
+}
+
+/// Parse a position update from options WS (dt:12 snapshot / dt:27 event).
+/// Both use abbreviated field names.
+fn parse_options_position_update(account_id: &str, p: &Value) -> Option<WsPositionUpdate> {
+    let symbol = parse_str(&p["s"])?;
+    let si = p["si"].as_i64()
+        .or_else(|| p["si"].as_str().and_then(|s| s.parse().ok()))
+        .unwrap_or(1);
+    let direction = if si == 1 { "buy" } else { "sell" };
+    let size = parse_f64(&p["q"]).unwrap_or(0.0);
 
     Some(WsPositionUpdate {
         account_id:      account_id.to_string(),
         exchange:        "coincall".to_string(),
-        instrument_name: inst.to_string(),
+        instrument_name: symbol,
         direction:       direction.to_string(),
         size,
-        average_price:   p["avgPrice"].as_f64().unwrap_or(0.0),
-        mark_price:      p["markPrice"].as_f64().unwrap_or(0.0),
-        unrealized_pnl:  p["unrealisedPnl"].as_f64().or_else(|| p["unrealizedPnl"].as_f64()).unwrap_or(0.0),
-        delta:           p["delta"].as_f64().unwrap_or(0.0),
-        gamma:           p["gamma"].as_f64().unwrap_or(0.0),
-        theta:           p["theta"].as_f64().unwrap_or(0.0),
-        vega:            p["vega"].as_f64().unwrap_or(0.0),
+        average_price:   parse_f64(&p["ap"]).unwrap_or(0.0),
+        mark_price:      parse_f64(&p["mp"]).unwrap_or(0.0),
+        unrealized_pnl:  parse_f64(&p["upnl"]).unwrap_or(0.0),
+        delta:           parse_f64(&p["delta"]).unwrap_or(0.0),
+        gamma:           parse_f64(&p["gamma"]).unwrap_or(0.0),
+        theta:           parse_f64(&p["theta"]).unwrap_or(0.0),
+        vega:            parse_f64(&p["vega"]).unwrap_or(0.0),
     })
 }
 

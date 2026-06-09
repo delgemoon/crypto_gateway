@@ -46,13 +46,14 @@ pub fn spawn(
     exchange_symbol: String,
     symbol: String,
     kind: String,
+    emit_interval_ms: u32,
     mut cmd_rx: mpsc::Receiver<MarketCmd>,
 ) {
     tokio::spawn(async move {
         let mut backoff = 1u64;
         loop {
             if cmd_rx.try_recv().is_ok() { break; }
-            match run_once(&app, &exchange_symbol, &symbol, &kind, &mut cmd_rx).await {
+            match run_once(&app, &exchange_symbol, &symbol, &kind, emit_interval_ms, &mut cmd_rx).await {
                 Ok(()) => break,
                 Err(e) => {
                     eprintln!("[market/bybit][{}] {}", exchange_symbol, e);
@@ -69,6 +70,7 @@ async fn run_once(
     exch_sym: &str,
     symbol: &str,
     kind: &str,
+    emit_interval_ms: u32,
     cmd_rx: &mut mpsc::Receiver<MarketCmd>,
 ) -> Result<(), String> {
     let url = ws_url(exch_sym, kind);
@@ -102,7 +104,7 @@ async fn run_once(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(t))) => {
-                        handle_msg(app, exch_sym, symbol, &t, &mut bids, &mut asks, &mut last_book_emit);
+                        handle_msg(app, exch_sym, symbol, &t, &mut bids, &mut asks, &mut last_book_emit, emit_interval_ms);
                     }
                     Some(Ok(Message::Ping(d))) => { let _ = write.send(Message::Pong(d)).await; }
                     None | Some(Err(_)) => return Err("disconnected".into()),
@@ -142,6 +144,7 @@ fn handle_msg(
     bids: &mut BookMap,
     asks: &mut BookMap,
     last_book_emit: &mut i64,
+    emit_interval_ms: u32,
 ) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v, Err(_) => return,
@@ -156,9 +159,9 @@ fn handle_msg(
         apply_bybit_levels(bids, &data["b"], is_snapshot);
         apply_bybit_levels(asks, &data["a"], is_snapshot);
 
-        // Throttle: emit at most once every 80ms
+        // Throttle: configurable emit interval
         let now = now_ms();
-        if now - *last_book_emit < 80 { return; }
+        if now - *last_book_emit < emit_interval_ms as i64 { return; }
         *last_book_emit = now;
 
         let bid_levels: Vec<[f64; 2]> = bids.iter().rev().take(MAX_LEVELS)

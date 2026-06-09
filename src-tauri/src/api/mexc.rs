@@ -155,6 +155,7 @@ pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<Vec<Instrum
                     min_trade_amount:     s["baseSizePrecision"].as_str()
                                             .and_then(|s| s.parse().ok())
                                             .unwrap_or(0.0001),
+                    qty_step:             None,
                     contract_size:        None,
                     option_type:          None,
                     strike:               None,
@@ -190,6 +191,7 @@ pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<Vec<Instrum
                         is_active:            true,
                         tick_size:            s["priceUnit"].as_f64().unwrap_or(0.01),
                         min_trade_amount:     s["minVol"].as_f64().unwrap_or(1.0),
+                        qty_step:             None,
                         contract_size:        s["contractSize"].as_f64(),
                         option_type:          None,
                         strike:               None,

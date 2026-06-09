@@ -181,6 +181,10 @@ pub fn init_db(db_path: &Path) -> Result<DbPool, String> {
         "ALTER TABLE general_settings ADD COLUMN bot_id INTEGER NOT NULL DEFAULT 1",
         [],
     );
+    let _ = conn.execute(
+        "ALTER TABLE general_settings ADD COLUMN book_emit_interval_ms INTEGER NOT NULL DEFAULT 80",
+        [],
+    );
     // Add rate_tier column to accounts (idempotent)
     let _ = conn.execute(
         "ALTER TABLE accounts ADD COLUMN rate_tier TEXT NOT NULL DEFAULT 'tier1'",

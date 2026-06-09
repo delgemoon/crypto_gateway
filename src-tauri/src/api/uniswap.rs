@@ -295,6 +295,7 @@ pub async fn fetch_instruments(_currency: &str, _kind: &str) -> Result<Vec<crate
                     is_active:       true,
                     tick_size:       0.01,
                     min_trade_amount: 0.001,
+                    qty_step:        None,
                     contract_size:   None,
                     option_type:     None,
                     strike:          None,

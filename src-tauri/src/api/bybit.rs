@@ -135,7 +135,8 @@ async fn fetch_by_category(currency: &str, category: &'static str, kind_label: &
             is_active:            true,
             tick_size:            i["priceFilter"]["tickSize"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.01),
             min_trade_amount:     i["lotSizeFilter"]["minOrderQty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(1.0),
-            contract_size:        i["lotSizeFilter"]["qtyStep"].as_str().and_then(|s| s.parse().ok()),
+            qty_step:             i["lotSizeFilter"]["qtyStep"].as_str().and_then(|s| s.parse().ok()),
+            contract_size:        None,
             option_type: {
                 let from_field = i["optionsType"].as_str()
                     .filter(|s| !s.is_empty())

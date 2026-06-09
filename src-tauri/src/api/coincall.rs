@@ -54,6 +54,7 @@ fn cc_sign(
     } else {
         format!("{}{}?{}&{}", method, uri, sorted_user_params, auth)
     };
+    eprintln!("[coincall] prehash: {}", prehash);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(prehash.as_bytes());
     hex::encode(mac.finalize().into_bytes()).to_uppercase()
@@ -113,10 +114,23 @@ fn auth_post(api_key: &str, secret: &str, uri: &str, body: &Value) -> HeaderMap 
 
 // ── WebSocket URL (authenticated) ────────────────────────────────────────────
 //
-// CoInCall WS requires auth params in the URL:
-//   wss://ws.coincall.com/{options|futures}?code=10&uuid=KEY&ts=TS&sign=SIGN&apiKey=KEY
+// CoInCall WS endpoint pattern:
+//   Production:  wss://ws.coincall.com/{options|futures|spot}/ws
+//   Testnet:     wss://betaws.seizeyouralpha.com/{options|futures|spot}/ws
 //
 // Sign prehash: `GET/users/self/verify?apiKey=KEY&ts=TS`
+
+const WS_PROD: &str = "wss://ws.coincall.com";
+const WS_TEST: &str = "wss://betaws.seizeyouralpha.com";
+
+/// Map kind string to CoInCall WS/HTTP channel name.
+pub fn kind_to_channel(kind: &str) -> &'static str {
+    match kind {
+        "option"    => "options",
+        "future" | "perpetual" => "futures",
+        _           => "spot",
+    }
+}
 
 pub fn get_ws_url(account: &Account, kind: &str) -> Result<String, String> {
     let api_key = &account.api_key;
@@ -132,27 +146,29 @@ pub fn get_ws_url(account: &Account, kind: &str) -> Result<String, String> {
     mac.update(prehash.as_bytes());
     let sign = hex::encode(mac.finalize().into_bytes()).to_uppercase();
 
-    let base_ws = if account.testnet { "wss://ws-test.coincall.com" } else { "wss://ws.coincall.com" };
-    let channel = if kind == "option" { "options" } else { "futures" };
-    let url = format!(
-        "{}/{}?code=10&uuid={}&ts={}&sign={}&apiKey={}",
-        base_ws, channel, api_key, ts, sign, api_key
-    );
+    let base_ws = if account.testnet { WS_TEST } else { WS_PROD };
+    let channel = kind_to_channel(kind);
+    // Spot endpoint has an extra /ws path segment; options and futures do not.
+    let url = if channel == "spot" {
+        format!("{}/{}/ws?code=10&uuid={}&ts={}&sign={}&apiKey={}", base_ws, channel, api_key, ts, sign, api_key)
+    } else {
+        format!("{}/{}?code=10&uuid={}&ts={}&sign={}&apiKey={}", base_ws, channel, api_key, ts, sign, api_key)
+    };
     Ok(url)
 }
 
 // ── Instruments (public) ───────────────────────────────────────────────────
 
-pub async fn fetch_instruments(currency: &str, kind: &str) -> Result<Vec<Instrument>, String> {
+pub async fn fetch_instruments(currency: &str, kind: &str, testnet: bool) -> Result<Vec<Instrument>, String> {
     if kind == "option" {
-        fetch_option_instruments(currency).await
+        fetch_option_instruments(currency, testnet).await
     } else {
-        fetch_future_instruments(currency).await
+        fetch_future_instruments(currency, testnet).await
     }
 }
 
-async fn fetch_option_instruments(currency: &str) -> Result<Vec<Instrument>, String> {
-    let url = format!("{}/open/option/getInstruments/{}", CC_BASE, currency.to_uppercase());
+async fn fetch_option_instruments(currency: &str, testnet: bool) -> Result<Vec<Instrument>, String> {
+    let url = format!("{}/open/option/getInstruments/{}", base(testnet), currency.to_uppercase());
     let resp: Value = Client::new()
         .get(&url)
         .header(CONTENT_TYPE, "application/json")
@@ -183,6 +199,7 @@ async fn fetch_option_instruments(currency: &str) -> Result<Vec<Instrument>, Str
                 is_active:            i["isActive"].as_bool().unwrap_or(true),
                 tick_size:            i["tickSize"].as_f64().unwrap_or(0.1),
                 min_trade_amount:     i["minQty"].as_f64().unwrap_or(0.01),
+                qty_step:             None,
                 contract_size:        Some(0.01),
                 option_type,
                 strike:               i["strike"].as_f64(),
@@ -193,9 +210,9 @@ async fn fetch_option_instruments(currency: &str) -> Result<Vec<Instrument>, Str
     Ok(instruments)
 }
 
-async fn fetch_future_instruments(currency: &str) -> Result<Vec<Instrument>, String> {
+async fn fetch_future_instruments(currency: &str, testnet: bool) -> Result<Vec<Instrument>, String> {
     // CoInCall futures config is in the public config endpoint
-    let url = format!("{}/open/public/config/v1", CC_BASE);
+    let url = format!("{}/open/public/config/v1", base(testnet));
     let resp: Value = Client::new()
         .get(&url)
         .header(CONTENT_TYPE, "application/json")
@@ -221,6 +238,7 @@ async fn fetch_future_instruments(currency: &str) -> Result<Vec<Instrument>, Str
                 is_active:            true,
                 tick_size:            cfg["tickSize"].as_f64().unwrap_or(0.1),
                 min_trade_amount:     cfg["minQty"].as_f64().unwrap_or(0.001),
+                qty_step:             None,
                 contract_size:        None,
                 option_type:          None,
                 strike:               None,
@@ -233,9 +251,9 @@ async fn fetch_future_instruments(currency: &str) -> Result<Vec<Instrument>, Str
 
 // ── Ticker (public for price; orderbook for bid/ask) ───────────────────────
 
-pub async fn fetch_ticker(instrument_name: &str) -> Result<Ticker, String> {
-    let detail_url = format!("{}/open/option/detail/v1/{}", CC_BASE, instrument_name);
-    let ob_url     = format!("{}/open/option/order/orderbook/v1/{}", CC_BASE, instrument_name);
+pub async fn fetch_ticker(instrument_name: &str, testnet: bool) -> Result<Ticker, String> {
+    let detail_url = format!("{}/open/option/detail/v1/{}", base(testnet), instrument_name);
+    let ob_url     = format!("{}/open/option/order/orderbook/v1/{}", base(testnet), instrument_name);
 
     // Run both requests concurrently
     let (detail_resp, ob_resp): (Value, Value) = tokio::try_join!(
@@ -312,11 +330,56 @@ fn tif_code(tif: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// True for option symbols like `BTCUSD-10JAN25-89000-C` / `...-P`
+fn is_option_symbol(symbol: &str) -> bool {
+    symbol.ends_with("-C") || symbol.ends_with("-P")
+}
+
+/// Returns (create_uri, cancel_uri, pending_uri, history_uri) for the given symbol.
+fn order_uris(symbol: &str) -> (&'static str, &'static str, &'static str, &'static str) {
+    if is_option_symbol(symbol) {
+        (
+            "/open/option/order/create/v1",
+            "/open/option/order/cancel/v1",
+            "/open/option/order/pending/v1",
+            "/open/option/order/history/v1",
+        )
+    } else {
+        (
+            "/open/futures/order/create/v1",
+            "/open/futures/order/cancel/v1",
+            "/open/futures/order/pending/v1",
+            "/open/futures/order/history/v1",
+        )
+    }
+}
+
+/// Parse an order from either options or futures pending/history response.
+fn parse_order(o: &Value) -> Order {
+    let side_num = o["tradeSide"].as_i64().unwrap_or(1);
+    let type_num = o["tradeType"].as_i64().unwrap_or(1);
+    Order {
+        order_id:              o["orderId"].as_i64().unwrap_or(0).to_string(),
+        instrument_name:       o["symbol"].as_str().unwrap_or("").to_string(),
+        direction:             if side_num == 1 { "buy" } else { "sell" }.to_string(),
+        order_type:            match type_num { 2 => "market", 3 => "limit_post", _ => "limit" }.to_string(),
+        order_state:           "open".to_string(),
+        price:                 o["price"].as_f64(),
+        amount:                o["qty"].as_f64().unwrap_or(0.0),
+        filled_amount:         o["fillQty"].as_f64().unwrap_or(0.0),
+        average_price:         o["avgPrice"].as_f64(),
+        post_only:             type_num == 3,
+        time_in_force:         "good_til_cancelled".to_string(),
+        creation_timestamp:    o["createTime"].as_i64().unwrap_or(0),
+        last_update_timestamp: o["createTime"].as_i64().unwrap_or(0),
+    }
+}
+
 // ── Place Order (SIGNED) ───────────────────────────────────────────────────
 
 pub async fn place_order(req: &PlaceOrderRequest, account: &Account) -> Result<OrderResult, String> {
     let base_url = base(account.testnet);
-    let uri = "/open/option/order/create/v1";
+    let uri = order_uris(&req.instrument_name).0;
     let ts = now_ms();
 
     let mut body = json!({
@@ -381,11 +444,11 @@ pub async fn place_order(req: &PlaceOrderRequest, account: &Account) -> Result<O
 
 pub async fn cancel_order(
     order_id: &str,
-    _instrument_name: Option<&str>,
+    instrument_name: Option<&str>,
     account: &Account,
 ) -> Result<bool, String> {
     let base_url = base(account.testnet);
-    let uri = "/open/option/order/cancel/v1";
+    let uri = order_uris(instrument_name.unwrap_or("")).1;
 
     // orderId is a numeric i64 on CoInCall
     let oid: i64 = order_id.parse().unwrap_or(0);
@@ -410,113 +473,97 @@ pub async fn cancel_order(
 
 // ── Open Orders (SIGNED) ───────────────────────────────────────────────────
 
-pub async fn get_open_orders(instrument_name: &str, account: &Account) -> Result<Vec<Order>, String> {
+async fn fetch_pending_orders(uri: &str, symbol_filter: Option<&str>, account: &Account) -> Vec<Order> {
     let base_url = base(account.testnet);
-    let uri = "/open/option/order/pending/v1";
-
-    // Extract base currency: "BTCUSD-14SEP23-..." → first 3 chars → "BTC"
-    let currency = instrument_name
-        .split('-').next()
-        .map(|s| &s[..s.len().min(3)])
-        .unwrap_or("BTC");
-
-    let params: &[(&str, String)] = &[
-        ("currency", currency.to_string()),
-        ("pageSize", "200".to_string()),
-    ];
-    let (headers, query) = auth_get(&account.api_key, &account.api_secret, uri, params);
-
-    let resp: Value = Client::new()
+    let mut params: Vec<(&str, String)> = vec![("pageSize", "200".to_string())];
+    if let Some(sym) = symbol_filter {
+        if !sym.is_empty() {
+            params.push(("symbol", sym.to_string()));
+        }
+    }
+    let (headers, query) = auth_get(&account.api_key, &account.api_secret, uri, &params);
+    let resp: Value = match Client::new()
         .get(&format!("{}{}?{}", base_url, uri, query))
         .headers(headers)
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+        .send().await
+    {
+        Ok(r) => r.json().await.unwrap_or(Value::Null),
+        Err(_) => Value::Null,
+    };
+    if resp["code"].as_i64() != Some(0) { return vec![]; }
+    resp["data"]["list"].as_array().unwrap_or(&vec![]).iter().map(parse_order).collect()
+}
 
-    if resp["code"].as_i64() != Some(0) {
-        return Ok(vec![]);
+pub async fn get_open_orders(instrument_name: &str, account: &Account) -> Result<Vec<Order>, String> {
+    if instrument_name.is_empty() {
+        // Fetch both option and futures open orders and merge
+        let (opt, fut) = tokio::join!(
+            fetch_pending_orders("/open/option/order/pending/v1",  None, account),
+            fetch_pending_orders("/open/futures/order/pending/v1", None, account),
+        );
+        let mut all = opt;
+        all.extend(fut);
+        return Ok(all);
     }
-
-    let list = resp["data"]["list"].as_array()
-        .map(|a| a.as_slice())
-        .unwrap_or(&[]);
-
-    // Filter to the specific instrument if one is given
-    let is_filter = instrument_name.contains('-');
-
-    let orders = list.iter()
-        .filter(|o| {
-            if is_filter {
-                o["symbol"].as_str().unwrap_or("") == instrument_name
-            } else {
-                true
-            }
-        })
-        .map(|o| {
-            let side_num = o["tradeSide"].as_i64().unwrap_or(1);
-            let type_num = o["tradeType"].as_i64().unwrap_or(1);
-            Order {
-                order_id:             o["orderId"].as_i64().unwrap_or(0).to_string(),
-                instrument_name:      o["symbol"].as_str().unwrap_or("").to_string(),
-                direction:            if side_num == 1 { "buy" } else { "sell" }.to_string(),
-                order_type:           match type_num { 2 => "market", 3 => "limit_post", _ => "limit" }.to_string(),
-                order_state:          "open".to_string(),
-                price:                o["price"].as_f64(),
-                amount:               o["qty"].as_f64().unwrap_or(0.0),
-                filled_amount:        o["fillQty"].as_f64().unwrap_or(0.0),
-                average_price:        o["avgPrice"].as_f64(),
-                post_only:            type_num == 3,
-                time_in_force:        "good_til_cancelled".to_string(),
-                creation_timestamp:   o["createTime"].as_i64().unwrap_or(0),
-                last_update_timestamp: o["createTime"].as_i64().unwrap_or(0),
-            }
-        })
-        .collect();
-
+    let uri = order_uris(instrument_name).2;
+    let orders = fetch_pending_orders(uri, Some(instrument_name), account).await;
     Ok(orders)
 }
 
-// ── Account Summary (SIGNED) ───────────────────────────────────────────────
-
-/// Get ALL open orders — reuses existing endpoint but with no instrument filter.
+/// Get ALL open orders (options + futures merged).
 pub async fn get_all_open_orders(account: &Account) -> Result<Vec<Order>, String> {
     get_open_orders("", account).await
 }
 
-/// Get trade history (filled orders) for this account.
+/// Get trade history (filled orders) for this account (options + futures merged).
 pub async fn get_trade_history(account: &Account, start_ms: i64, end_ms: i64) -> Result<Vec<Trade>, String> {
     let base_url = base(account.testnet);
-    let uri = "/open/option/order/history/v1";
     let mut user_params: Vec<(&str, String)> = vec![("pageSize", "200".to_string())];
     if start_ms > 0 { user_params.push(("startTime", start_ms.to_string())); }
     if end_ms   > 0 { user_params.push(("endTime",   end_ms.to_string())); }
-    let params_ref: Vec<(&str, String)> = user_params;
-    let (headers, query) = auth_get(&account.api_key, &account.api_secret, uri, &params_ref);
-    let resp: Value = Client::new()
-        .get(&format!("{}{}?{}", base_url, uri, query))
-        .headers(headers)
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
-    if resp["code"].as_i64() != Some(0) { return Ok(vec![]); }
-    let list = resp["data"]["list"].as_array().map(|a| a.as_slice()).unwrap_or(&[]);
-    let trades = list.iter().map(|t| {
-        let side_num = t["tradeSide"].as_i64().unwrap_or(1);
-        Trade {
-            trade_id:        t["tradeId"].as_str().map(|s| s.to_string())
-                             .or_else(|| t["tradeId"].as_i64().map(|n| n.to_string()))
-                             .unwrap_or_default(),
-            account_id:      String::new(),
-            account_name:    String::new(),
-            exchange:        "coincall".to_string(),
-            instrument_name: t["symbol"].as_str().unwrap_or("").to_string(),
-            direction:       if side_num == 1 { "buy" } else { "sell" }.to_string(),
-            amount:          t["qty"].as_f64().unwrap_or(0.0),
-            price:           t["price"].as_f64().unwrap_or(0.0),
-            fee:             t["fee"].as_f64().unwrap_or(0.0),
-            fee_currency:    t["feeCurrency"].as_str().unwrap_or("USD").to_string(),
-            timestamp:       t["createTime"].as_i64().unwrap_or(0),
-            order_id:        t["orderId"].as_i64().map(|n| n.to_string()).unwrap_or_default(),
-        }
-    }).collect();
+
+    let parse_resp = |resp: &Value| -> Vec<Trade> {
+        if resp["code"].as_i64() != Some(0) { return vec![]; }
+        resp["data"]["list"].as_array().unwrap_or(&vec![]).iter().map(|t| {
+            let side_num = t["tradeSide"].as_i64().unwrap_or(1);
+            Trade {
+                trade_id:        t["tradeId"].as_str().map(|s| s.to_string())
+                                 .or_else(|| t["tradeId"].as_i64().map(|n| n.to_string()))
+                                 .unwrap_or_default(),
+                account_id:      String::new(),
+                account_name:    String::new(),
+                exchange:        "coincall".to_string(),
+                instrument_name: t["symbol"].as_str().unwrap_or("").to_string(),
+                direction:       if side_num == 1 { "buy" } else { "sell" }.to_string(),
+                amount:          t["qty"].as_f64().unwrap_or(0.0),
+                price:           t["price"].as_f64().unwrap_or(0.0),
+                fee:             t["fee"].as_f64().unwrap_or(0.0),
+                fee_currency:    t["feeCurrency"].as_str().unwrap_or("USD").to_string(),
+                timestamp:       t["createTime"].as_i64().unwrap_or(0),
+                order_id:        t["orderId"].as_i64().map(|n| n.to_string()).unwrap_or_default(),
+            }
+        }).collect()
+    };
+
+    let (opt_h, opt_q) = auth_get(&account.api_key, &account.api_secret, "/open/option/order/history/v1", &user_params);
+    let opt_resp: Value = match Client::new()
+        .get(&format!("{}/open/option/order/history/v1?{}", base_url, opt_q))
+        .headers(opt_h).send().await {
+            Ok(r) => r.json().await.unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+
+    let (fut_h, fut_q) = auth_get(&account.api_key, &account.api_secret, "/open/futures/order/history/v1", &user_params);
+    let fut_resp: Value = match Client::new()
+        .get(&format!("{}/open/futures/order/history/v1?{}", base_url, fut_q))
+        .headers(fut_h).send().await {
+            Ok(r) => r.json().await.unwrap_or(Value::Null),
+            Err(_) => Value::Null,
+        };
+
+    let mut trades = parse_resp(&opt_resp);
+    trades.extend(parse_resp(&fut_resp));
+    trades.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(trades)
 }
 
@@ -741,11 +788,11 @@ pub async fn get_rfq_quotes(account: &Account, request_id: Option<&str>) -> Resu
     Ok(resp["data"].clone())
 }
 
-pub async fn fetch_orderbook(instrument_name: &str, depth: u32) -> Result<OrderbookSnapshot, String> {
+pub async fn fetch_orderbook(instrument_name: &str, depth: u32, testnet: bool) -> Result<OrderbookSnapshot, String> {
     let client = Client::new();
     let url = format!(
         "{}/md/orderbook?instrumentId={}&depth={}",
-        CC_BASE, instrument_name, depth
+        base(testnet), instrument_name, depth
     );
 
     let resp: Value = client.get(&url).send().await.map_err(|e| e.to_string())?

@@ -7,6 +7,7 @@
 //!   `market://book`   — MarketBookEvent
 //!   `market://ticker` — MarketTickerEvent
 
+pub mod bullish;
 pub mod bybit;
 pub mod coincall;
 pub mod deribit;
@@ -53,6 +54,7 @@ impl MarketDataManager {
         symbol: String,
         kind: String,
         ws_url: Option<String>,
+        emit_interval_ms: u32,
     ) {
         let key: SubKey = (exchange.clone(), exchange_symbol.clone());
         let mut subs = self.subs.lock().await;
@@ -63,9 +65,10 @@ impl MarketDataManager {
         let (cmd_tx, cmd_rx) = mpsc::channel::<MarketCmd>(4);
 
         match exchange.as_str() {
-            "deribit"  => deribit::spawn(app, exchange_symbol.clone(), symbol, cmd_rx),
-            "okx"      => okx::spawn(app, exchange_symbol.clone(), symbol, cmd_rx),
-            "bybit"    => bybit::spawn(app, exchange_symbol.clone(), symbol, kind, cmd_rx),
+            "deribit"  => deribit::spawn(app, exchange_symbol.clone(), symbol, emit_interval_ms, cmd_rx),
+            "okx"      => okx::spawn(app, exchange_symbol.clone(), symbol, emit_interval_ms, cmd_rx),
+            "bybit"    => bybit::spawn(app, exchange_symbol.clone(), symbol, kind, emit_interval_ms, cmd_rx),
+            "bullish"  => bullish::spawn(app, exchange_symbol.clone(), symbol, emit_interval_ms, cmd_rx),
             "coincall" => {
                 let url = match ws_url {
                     Some(u) => u,
@@ -74,7 +77,7 @@ impl MarketDataManager {
                         return;
                     }
                 };
-                coincall::spawn(app, exchange_symbol.clone(), symbol, kind, url, cmd_rx);
+                coincall::spawn(app, exchange_symbol.clone(), symbol, kind, url, emit_interval_ms, cmd_rx);
             }
             _ => {
                 eprintln!("[market] unsupported exchange for public WS: {}", exchange);

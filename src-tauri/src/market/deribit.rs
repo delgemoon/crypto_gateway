@@ -29,13 +29,14 @@ pub fn spawn(
     app: AppHandle,
     exchange_symbol: String,
     symbol: String,
+    emit_interval_ms: u32,
     mut cmd_rx: mpsc::Receiver<MarketCmd>,
 ) {
     tokio::spawn(async move {
         let mut backoff = 1u64;
         loop {
             if cmd_rx.try_recv().is_ok() { break; }
-            match run_once(&app, &exchange_symbol, &symbol, &mut cmd_rx).await {
+            match run_once(&app, &exchange_symbol, &symbol, emit_interval_ms, &mut cmd_rx).await {
                 Ok(()) => break,
                 Err(e) => {
                     eprintln!("[market/deribit][{}] {}", exchange_symbol, e);
@@ -51,6 +52,7 @@ async fn run_once(
     app: &AppHandle,
     exch_sym: &str,
     symbol: &str,
+    emit_interval_ms: u32,
     cmd_rx: &mut mpsc::Receiver<MarketCmd>,
 ) -> Result<(), String> {
     let (ws, _) = connect_async_tls_with_config(WS_URL, None, false, None)
@@ -75,7 +77,7 @@ async fn run_once(
             _ = async { cmd_rx.recv().await } => return Ok(()),
             msg = read.next() => {
                 match msg {
-                    Some(Ok(Message::Text(t))) => handle_msg(app, exch_sym, symbol, &t, &mut bids, &mut asks, &mut last_book_emit),
+                    Some(Ok(Message::Text(t))) => handle_msg(app, exch_sym, symbol, &t, &mut bids, &mut asks, &mut last_book_emit, emit_interval_ms),
                     Some(Ok(Message::Ping(d))) => { let _ = write.send(Message::Pong(d)).await; }
                     None | Some(Err(_)) => return Err("disconnected".into()),
                     _ => {}
@@ -93,6 +95,7 @@ fn handle_msg(
     bids: &mut BookMap,
     asks: &mut BookMap,
     last_book_emit: &mut i64,
+    emit_interval_ms: u32,
 ) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v, Err(_) => return,
@@ -126,9 +129,9 @@ fn handle_msg(
         apply(bids, &data["bids"], is_snapshot);
         apply(asks, &data["asks"], is_snapshot);
 
-        // Throttle: emit at most once every 80ms to avoid flooding JS heap
+        // Throttle: configurable emit interval
         let now = now_ms();
-        if now - *last_book_emit < 80 { return; }
+        if now - *last_book_emit < emit_interval_ms as i64 { return; }
         *last_book_emit = now;
 
         let bid_levels: Vec<[f64; 2]> = bids.iter().rev().take(MAX_LEVELS)
