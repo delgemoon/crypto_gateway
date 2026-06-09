@@ -1,7 +1,7 @@
 import { FunctionComponent, useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { useAppDispatch, useAppSelector } from '../../hooks';
-import { selectSelectedInstrument, selectInstruments, Instrument, selectPriceFromBook } from './instrumentsSlice';
+import { selectSelectedInstrument, selectInstruments, selectExchangeSymbol, Instrument, ReferenceData, selectPriceFromBook } from './instrumentsSlice';
 import { selectActiveAccountId, selectAccounts, setActiveAccount } from '../Settings/settingsSlice';
 import { setLastOrderResult, setSubmitting, selectSubmitting, selectLastOrderResult, setOpenOrders } from './ordersSlice';
 import { selectWsStatus, WsConnectionStatus } from '../WsManager/wsSlice';
@@ -316,7 +316,8 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const OrderForm: FunctionComponent = () => {
   const dispatch = useAppDispatch();
   const instrument = useAppSelector(selectSelectedInstrument);
-  const instruments = useAppSelector(selectInstruments);
+  const exchangeSymbol = useAppSelector(selectExchangeSymbol);
+  const instruments = useAppSelector(selectInstruments) as ReferenceData[];
   const activeAccountId = useAppSelector(selectActiveAccountId);
   const accounts = useAppSelector(selectAccounts);
   const submitting = useAppSelector(selectSubmitting);
@@ -372,13 +373,13 @@ const OrderForm: FunctionComponent = () => {
   };
 
   // Fetch hedge instruments when hedge type selected
-  const currentInstrument = instruments.find((i) => i.instrument_name === instrument);
-  const baseCurrency = currentInstrument?.base_currency ?? 'BTC';
+  const currentRef = instruments.find((r) => r.symbol === instrument) ?? null;
+  const baseCurrency = currentRef?.base ?? 'BTC';
 
   useEffect(() => {
-    if ((orderType === 'hedge' || orderType === 'smart_hedge') && activeAccountId) {
+    if ((orderType === 'hedge' || orderType === 'smart_hedge') && activeAccountId && activeAccount) {
       invoke<Instrument[]>('fetch_instruments', {
-        accountId: activeAccountId,
+        exchange: activeAccount.exchange,
         currency: baseCurrency,
         kind: 'future',
       })
@@ -395,7 +396,6 @@ const OrderForm: FunctionComponent = () => {
     }
   }, [orderType, activeAccountId, baseCurrency]);
 
-  // Derived flags
   const activeAccount = accounts.find((a) => a.id === activeAccountId) ?? null;
   const isOptionsExchange = ['deribit', 'coincall'].includes(activeAccount?.exchange ?? '');
   const wsStatus = useAppSelector(selectWsStatus(activeAccountId ?? ''));
@@ -405,7 +405,7 @@ const OrderForm: FunctionComponent = () => {
     wsStatus === 'reconnecting' ? 'Reconnecting…' :
     wsStatus === 'error'        ? 'WS Error' :
     'WS Offline';
-  const minAmount = currentInstrument?.min_trade_amount ?? 1;
+  const minAmount = currentRef?.venues.find(v => v.exchange === (activeAccount?.exchange ?? ''))?.minTradeAmount ?? 1;
   const showPrice = ['limit', 'limit_post', 'stop_limit', 'stop_market', 'smart_post', 'smart_hedge'].includes(orderType);
   const showTif   = ['limit', 'limit_post', 'stop_limit'].includes(orderType);
   const isSmartType = ['smart_post', 'hedge', 'smart_hedge'].includes(orderType);
@@ -473,10 +473,10 @@ const OrderForm: FunctionComponent = () => {
   };
 
   // Get best bid (buy) or best ask (sell) from ticker
-  const getTopPrice = async (instrumentName: string): Promise<number | null> => {
+  const getTopPrice = async (instrName: string): Promise<number | null> => {
     const ticker = await invoke<any>('fetch_ticker', {
-      accountId: activeAccountId,
-      instrumentName,
+      exchange: activeAccount?.exchange ?? '',
+      instrumentName: instrName,
     }).catch(() => null);
     if (!ticker) return null;
     return side === 'buy'
@@ -486,8 +486,8 @@ const OrderForm: FunctionComponent = () => {
 
   // Refresh open orders panel
   const refreshOpenOrders = () => {
-    if (!activeAccountId || !instrument) return;
-    invoke<any[]>('get_open_orders', { accountId: activeAccountId, instrumentName: instrument })
+    if (!activeAccountId || !exchangeSymbol) return;
+    invoke<any[]>('get_open_orders', { accountId: activeAccountId, instrumentName: exchangeSymbol })
       .then((orders) => dispatch(setOpenOrders(orders)))
       .catch(() => {});
   };
@@ -495,21 +495,21 @@ const OrderForm: FunctionComponent = () => {
   // Smart Post: place limit at top-of-book, optionally chase
   const executeSmartPost = async () => {
     const qty = parseFloat(amount);
-    if (!qty || !instrument) return;
+    if (!qty || !exchangeSymbol) return;
     setExecuting(true);
     setExecLog([]);
-    addLog(`Smart Post: ${side} ${qty} ${instrument}`);
+    addLog(`Smart Post: ${side} ${qty} ${exchangeSymbol}`);
 
     let chaseCount = 0;
     let remaining = qty;
 
     while (remaining > 0 && mountedRef.current) {
-      const topPrice = await getTopPrice(instrument);
+      const topPrice = await getTopPrice(exchangeSymbol);
       if (topPrice == null) { addLog('Cannot fetch top-of-book price'); break; }
       addLog(`[${chaseCount}] Top-of-book = ${topPrice}`);
 
       const result = await placeOne({
-        instrumentName: instrument,
+        instrumentName: exchangeSymbol,
         side,
         orderType: 'limit',
         amount: remaining,
@@ -530,7 +530,7 @@ const OrderForm: FunctionComponent = () => {
       await sleep(spIntervalMs);
       if (!mountedRef.current) break;
 
-      const open = await getOpenOrder(instrument, orderId);
+      const open = await getOpenOrder(exchangeSymbol, orderId);
       if (!open) {
         addLog('✓ Filled!');
         dispatch(setLastOrderResult(result));
@@ -582,7 +582,7 @@ const OrderForm: FunctionComponent = () => {
 
   // Smart Hedge: limit+chase loop, then break into market chunks
   const executeSmartHedge = async () => {
-    const hedgeInst = hedgeInstrument || instrument;
+    const hedgeInst = hedgeInstrument || exchangeSymbol;
     let remaining = parseFloat(amount);
     if (!remaining || !hedgeInst) return;
     setExecuting(true);
@@ -674,7 +674,7 @@ const OrderForm: FunctionComponent = () => {
       const result = await invoke<any>('place_order', {
         req: {
           account_id: activeAccountId,
-          instrument_name: instrument,
+          instrument_name: exchangeSymbol,
           side,
           order_type: isPost ? 'limit' : orderType,
           amount: parseFloat(amount),
@@ -706,10 +706,10 @@ const OrderForm: FunctionComponent = () => {
   const submitLabel = () => {
     if (busy) return executing ? 'Executing…' : 'Submitting…';
     const dirLabel = side === 'buy' ? 'Buy' : 'Sell';
-    if (orderType === 'smart_post')  return `Smart Post ${dirLabel} ${instrument || '—'}`;
+    if (orderType === 'smart_post')  return `Smart Post ${dirLabel} ${exchangeSymbol || '—'}`;
     if (orderType === 'hedge')       return `Hedge ${dirLabel} on ${hedgeInstrument || '—'}`;
-    if (orderType === 'smart_hedge') return `Smart Hedge ${dirLabel} ${hedgeInstrument || instrument || '—'}`;
-    return `${dirLabel} ${instrument || '—'}`;
+    if (orderType === 'smart_hedge') return `Smart Hedge ${dirLabel} ${hedgeInstrument || exchangeSymbol || '—'}`;
+    return `${dirLabel} ${exchangeSymbol || '—'}`;
   };
 
   return (
@@ -729,8 +729,8 @@ const OrderForm: FunctionComponent = () => {
           {activeAccount && (
             <InstrumentTag>
               <ExchangeBadge $ex={activeAccount.exchange}>{activeAccount.exchange}</ExchangeBadge>
-              {instrument
-                ? <><span>{instrument}</span>{activeAccount.testnet && ' · testnet'}</>
+              {exchangeSymbol
+                ? <><span>{exchangeSymbol}</span>{activeAccount.testnet && ' · testnet'}</>
                 : <span style={{ color: '#4a5568' }}>no instrument selected</span>
               }
             </InstrumentTag>

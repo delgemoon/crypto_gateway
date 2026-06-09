@@ -1,6 +1,7 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
 import { RootState } from '../../store';
 
+// Legacy type — still used by OrderForm hedge instrument fetches.
 export interface Instrument {
   instrument_name: string;
   kind: string;
@@ -14,6 +15,29 @@ export interface Instrument {
   option_type?: string;
   strike?: number;
   expiration_timestamp?: number;
+}
+
+// ── Canonical reference data model ──────────────────────────────────────────
+
+export interface VenueRef {
+  exchange: string;
+  exchangeSymbol: string;
+  tickSize: number;
+  minTradeAmount: number;
+  contractSize?: number;
+  settlementCurrency: string;
+}
+
+export interface ReferenceData {
+  symbol: string;         // canonical system symbol
+  kind: string;           // "spot" | "perpetual" | "future" | "option"
+  base: string;
+  quote: string;
+  strike?: number;
+  expiry?: string;        // "YYYYMMDD" | undefined (perpetual/spot)
+  optionType?: string;    // "C" | "P"
+  isActive: boolean;
+  venues: VenueRef[];
 }
 
 export interface TickerStats {
@@ -47,8 +71,9 @@ export interface Ticker {
 interface InstrumentsState {
   currency: string;
   kind: string;
-  instruments: Instrument[];
-  selectedInstrument: string;
+  instruments: ReferenceData[];
+  selectedInstrument: string;   // canonical symbol
+  exchangeSymbol: string;       // venue-specific symbol for order placement
   ticker: Ticker | null;
   loading: boolean;
   error: string | null;
@@ -59,7 +84,8 @@ const initialState: InstrumentsState = {
   currency: 'BTC',
   kind: 'future',
   instruments: [],
-  selectedInstrument: 'BTC-PERPETUAL',
+  selectedInstrument: 'BTC-USD-PERPETUAL',
+  exchangeSymbol: '',
   ticker: null,
   loading: false,
   error: null,
@@ -82,15 +108,18 @@ export const instrumentsSlice = createSlice({
       state.selectedInstrument = '';
       state.ticker = null;
     },
-    setInstruments(state, { payload }: PayloadAction<Instrument[]>) {
+    setInstruments(state, { payload }: PayloadAction<ReferenceData[]>) {
       state.instruments = payload;
-      if (payload.length > 0 && !payload.find((i) => i.instrument_name === state.selectedInstrument)) {
-        state.selectedInstrument = payload[0].instrument_name;
+      if (payload.length > 0 && !payload.find((r) => r.symbol === state.selectedInstrument)) {
+        state.selectedInstrument = payload[0].symbol;
       }
     },
     setSelectedInstrument(state, { payload }: PayloadAction<string>) {
       state.selectedInstrument = payload;
       state.ticker = null;
+    },
+    setExchangeSymbol(state, { payload }: PayloadAction<string>) {
+      state.exchangeSymbol = payload;
     },
     setTicker(state, { payload }: PayloadAction<Ticker>) {
       state.ticker = payload;
@@ -112,6 +141,7 @@ export const {
   setKind,
   setInstruments,
   setSelectedInstrument,
+  setExchangeSymbol,
   setTicker,
   setLoading,
   setError,
@@ -122,6 +152,7 @@ export const selectCurrency = (s: RootState) => s.instruments.currency;
 export const selectKind = (s: RootState) => s.instruments.kind;
 export const selectInstruments = (s: RootState) => s.instruments.instruments;
 export const selectSelectedInstrument = (s: RootState) => s.instruments.selectedInstrument;
+export const selectExchangeSymbol = (s: RootState) => s.instruments.exchangeSymbol;
 export const selectTicker = (s: RootState) => s.instruments.ticker;
 export const selectInstrumentsLoading = (s: RootState) => s.instruments.loading;
 export const selectPriceFromBook = (s: RootState) => s.instruments.priceFromBook;

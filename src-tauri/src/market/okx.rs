@@ -58,7 +58,7 @@ async fn run_once(
     let sub = json!({
         "op": "subscribe",
         "args": [
-            { "channel": "books", "instId": exch_sym },
+            { "channel": "books5", "instId": exch_sym },
             { "channel": "tickers", "instId": exch_sym },
         ]
     });
@@ -66,6 +66,7 @@ async fn run_once(
 
     let mut bids: BookMap = BTreeMap::new();
     let mut asks: BookMap = BTreeMap::new();
+    let mut last_book_emit: i64 = 0;
 
     // OKX requires a ping every 30s or the server closes the connection.
     let mut ping_interval = tokio::time::interval(Duration::from_secs(25));
@@ -81,7 +82,7 @@ async fn run_once(
                 match msg {
                     Some(Ok(Message::Text(t))) => {
                         if t == "pong" { continue; }
-                        handle_msg(app, exch_sym, symbol, &t, &mut bids, &mut asks);
+                        handle_msg(app, exch_sym, symbol, &t, &mut bids, &mut asks, &mut last_book_emit);
                     }
                     Some(Ok(Message::Ping(d))) => { let _ = write.send(Message::Pong(d)).await; }
                     None | Some(Err(_)) => return Err("disconnected".into()),
@@ -116,6 +117,7 @@ fn handle_msg(
     text: &str,
     bids: &mut BookMap,
     asks: &mut BookMap,
+    last_book_emit: &mut i64,
 ) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v, Err(_) => return,
@@ -124,7 +126,7 @@ fn handle_msg(
     let action  = v["action"].as_str().unwrap_or("snapshot");
     let ts = now_ms();
 
-    if channel == "books" {
+    if channel == "books5" || channel == "books" {
         let is_snapshot = action == "snapshot";
         if let Some(arr) = v["data"].as_array() {
             for entry in arr {
@@ -132,6 +134,12 @@ fn handle_msg(
                 apply_okx_levels(asks, &entry["asks"], is_snapshot);
             }
         }
+
+        // Throttle: emit at most once every 80ms
+        let now = now_ms();
+        if now - *last_book_emit < 80 { return; }
+        *last_book_emit = now;
+
         let bid_levels: Vec<[f64; 2]> = bids.iter().rev().take(MAX_LEVELS)
             .map(|(&k, &s)| [key_price(k), s]).collect();
         let ask_levels: Vec<[f64; 2]> = asks.iter().take(MAX_LEVELS)

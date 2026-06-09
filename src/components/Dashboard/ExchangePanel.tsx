@@ -1,17 +1,50 @@
 import { FunctionComponent, memo, useState, useEffect, useRef, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import useWebSocket from 'react-use-websocket';
+import { listen } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
 import styled from 'styled-components';
 import { useAppDispatch, useAppSelector } from '../../hooks';
 import { Account, setActiveAccount, selectGeneral } from '../Settings/settingsSlice';
-import { setSelectedInstrument, setInstruments, setPriceFromBook, Instrument, Ticker } from './instrumentsSlice';
+import { setSelectedInstrument, setInstruments, setExchangeSymbol, setPriceFromBook, ReferenceData, Ticker } from './instrumentsSlice';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
 type BookMap = Map<number, number>;
 interface BookLevel { price: number; size: number; total: number; depth: number; }
 interface ExpiryOption { key: string; label: string; }
+
+interface MarketBookEvent {
+  symbol: string;
+  exchange: string;
+  exchangeSymbol: string;
+  bids: [number, number][];
+  asks: [number, number][];
+  timestamp: number;
+}
+
+interface MarketTickerEvent {
+  symbol: string;
+  exchange: string;
+  exchangeSymbol: string;
+  last?: number;
+  mark?: number;
+  index?: number;
+  bid?: number;
+  ask?: number;
+  bidIv?: number;
+  askIv?: number;
+  markIv?: number;
+  delta?: number;
+  gamma?: number;
+  vega?: number;
+  theta?: number;
+  openInterest?: number;
+  priceChange24h?: number;
+  volume24h?: number;
+  high24h?: number;
+  low24h?: number;
+  timestamp: number;
+}
 
 // ── Constants ──────────────────────────────────────────────────────────────
 
@@ -28,37 +61,16 @@ const EXCHANGE_COLORS: Record<string, string> = {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-/** Normalise option_type to 'C' or 'P'.
- *  Handles: "call"/"put" (Deribit/Bybit), "C"/"P" (OKX), "Call"/"Put" */
-const normOptType = (s?: string | null): string =>
-  s ? s.toUpperCase().charAt(0) : '';
+/** Expiry key from a ReferenceData entry: perpetuals → 'PERP', futures → 'YYYYMMDD' */
+const expiryKey = (r: ReferenceData): string =>
+  (r.kind === 'perpetual' || !r.expiry) ? 'PERP' : r.expiry;
 
-// Deribit perpetuals carry expiration_timestamp = 32503708800000 (Jan 1, 3000).
-// Treat any timestamp beyond year 2100 as a perpetual/no-expiry instrument.
-const FAR_FUTURE_MS = new Date('2100-01-01').getTime(); // 4102444800000
-
-const isPerp = (ts?: number | null): boolean => !ts || ts > FAR_FUTURE_MS;
-
-const expiryKey = (ts?: number | null) => isPerp(ts) ? 'PERP' : String(ts);
-
-const formatExpiry = (ts?: number | null): string => {
-  if (isPerp(ts)) return 'PERP';
-  const d = new Date(ts!);
-  const day = d.getUTCDate().toString().padStart(2, '0');
-  const mon = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][d.getUTCMonth()];
-  return `${day}${mon}${String(d.getUTCFullYear()).slice(2)}`;
-};
-
-const applySnapshot = (levels: [number, number][]): BookMap => {
-  const m = new Map<number, number>();
-  for (const [p, s] of levels) if (s > 0) m.set(p, s);
-  return m;
-};
-
-const applyDelta = (m: BookMap, levels: [number, number][]): BookMap => {
-  const next = new Map(m);
-  for (const [p, s] of levels) { if (s === 0) next.delete(p); else next.set(p, s); }
-  return next;
+/** Format a YYYYMMDD key for display (e.g. '20240329' → '29MAR24'). */
+const formatExpiryKey = (key: string): string => {
+  if (key === 'PERP') return 'PERP';
+  const y = key.slice(0, 4), m = +key.slice(4, 6) - 1, d = key.slice(6, 8);
+  const mon = ['JAN','FEB','MAR','APR','MAY','JUN','JUL','AUG','SEP','OCT','NOV','DEC'][m] ?? '???';
+  return `${d}${mon}${y.slice(2)}`;
 };
 
 const buildLevels = (m: BookMap, side: 'bid' | 'ask', n: number): BookLevel[] => {
@@ -70,38 +82,6 @@ const buildLevels = (m: BookMap, side: 'bid' | 'ask', n: number): BookLevel[] =>
   const maxT = wt[wt.length - 1]?.total ?? 1;
   return wt.map(l => ({ ...l, depth: (l.total / maxT) * 100 }));
 };
-
-function wsUrl(exchange: string, kind: string, settlement: 'linear' | 'inverse'): string | null {
-  switch (exchange) {
-    case 'coincall': return null; // URL is signed; generated dynamically via get_coincall_ws_url
-    case 'okx':   return 'wss://ws.okx.com:8443/ws/v5/public';
-    case 'bybit':
-      if (kind === 'option') return 'wss://stream.bybit.com/v5/public/option';
-      if (kind === 'spot')   return 'wss://stream.bybit.com/v5/public/spot';
-      return settlement === 'inverse'
-        ? 'wss://stream.bybit.com/v5/public/inverse'
-        : 'wss://stream.bybit.com/v5/public/linear';
-    default: return 'wss://www.deribit.com/ws/api/v2';
-  }
-}
-
-let _msgId = 0;
-function subMsg(exchange: string, instrument: string, sub: boolean, kind = 'future'): object {
-  const op = sub ? 'subscribe' : 'unsubscribe';
-  switch (exchange) {
-    case 'coincall': {
-      const action = sub ? 'subscribe' : 'unSubscribe';
-      return { action, dataType: 'orderBook', payload: { symbol: instrument } };
-    }
-    case 'okx':   return { op, args: [{ channel: 'books', instId: instrument }, { channel: 'tickers', instId: instrument }] };
-    case 'bybit': {
-      // Bybit option WS only supports depths 1/25/200; linear/inverse supports 1/50/200/500
-      const depth = kind === 'option' ? 25 : 50;
-      return { op, args: [`orderbook.${depth}.${instrument}`, `tickers.${instrument}`] };
-    }
-    default:      return { jsonrpc: '2.0', id: ++_msgId, method: sub ? 'public/subscribe' : 'public/unsubscribe', params: { channels: [`book.${instrument}.100ms`, `ticker.${instrument}.100ms`] } };
-  }
-}
 
 // ── Styled ─────────────────────────────────────────────────────────────────
 
@@ -506,20 +486,20 @@ const EmptyBook = styled.div`
 `;
 
 // ── OrderBookPanel ──────────────────────────────────────────────────────────
-// Isolated sub-component: all WS state lives here so its 100ms re-renders
-// never touch the parent's <select> elements (which would close open dropdowns).
+// Isolated sub-component. All market data arrives via Tauri events from the
+// Rust backend WS tasks; no frontend WebSocket code here.
 
 interface OBPanelProps {
   account: Account;
-  instrument: string;
+  symbol: string;          // canonical system symbol
+  exchangeSymbol: string;  // venue-native symbol (for subscribe / display)
   kind: string;
-  settlement: 'linear' | 'inverse';
-  rawInstruments: Instrument[];
+  rawInstruments: ReferenceData[];
   onConnectedChange: (connected: boolean) => void;
 }
 
 const OrderBookPanel: FunctionComponent<OBPanelProps> = memo(({
-  account, instrument, kind, settlement, rawInstruments, onConnectedChange,
+  account, symbol, exchangeSymbol, kind, rawInstruments, onConnectedChange,
 }) => {
   const dispatch = useAppDispatch();
 
@@ -533,28 +513,9 @@ const OrderBookPanel: FunctionComponent<OBPanelProps> = memo(({
   const bookDirtyRef     = useRef(false);
   const tickerDirtyRef   = useRef(false);
 
-  const [ccWsUrl, setCcWsUrl] = useState<string | null>(null);
-  const subscribedRef = useRef('');
-
-  const url = useMemo(() => {
-    if (account.exchange === 'coincall') return ccWsUrl;
-    return wsUrl(account.exchange, kind, settlement);
-  }, [account.exchange, kind, settlement, ccWsUrl]);
-
-  // CoInCall: fetch signed WS URL from backend
-  useEffect(() => {
-    if (account.exchange !== 'coincall') { setCcWsUrl(null); return; }
-    invoke<string>('get_coincall_ws_url', { accountId: account.id, kind })
-      .then(u => setCcWsUrl(u))
-      .catch(() => setCcWsUrl(null));
-  }, [account.exchange, account.id, kind]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // Flush pending WS data into React state at ~10 fps.
-  // Skip flush entirely while a <select> is focused — prevents WebView2 from
-  // closing the native dropdown popup when the DOM updates.
+  // Flush pending data into React state at ~10 fps.
   useEffect(() => {
     const id = setInterval(() => {
-      if (document.activeElement?.tagName === 'SELECT') return;
       if (bookDirtyRef.current) {
         setBids(new Map(pendingBidsRef.current));
         setAsks(new Map(pendingAsksRef.current));
@@ -568,148 +529,71 @@ const OrderBookPanel: FunctionComponent<OBPanelProps> = memo(({
     return () => clearInterval(id);
   }, []);
 
-  const handleMessageRef = useRef<(raw: string) => void>(null!);
-
-  const parseOkx = (msg: any) => {
-    const ch = msg?.arg?.channel;
-    if (ch === 'books') {
-      const d = msg.data?.[0]; if (!d) return;
-      const toMap = (arr: string[][]): [number, number][] => arr.map(([p, q]) => [+p, +q]);
-      if (msg.action === 'snapshot') {
-        pendingBidsRef.current = applySnapshot(toMap(d.bids));
-        pendingAsksRef.current = applySnapshot(toMap(d.asks));
-      } else {
-        pendingBidsRef.current = applyDelta(pendingBidsRef.current, toMap(d.bids));
-        pendingAsksRef.current = applyDelta(pendingAsksRef.current, toMap(d.asks));
-      }
-      bookDirtyRef.current = true;
-    }
-    if (ch === 'tickers' && msg.data?.[0]) {
-      const d = msg.data[0];
-      const last = +d.last, open = +d.open24h;
-      pendingTickerRef.current = { instrument_name: d.instId, best_bid_price: +d.bidPx, best_ask_price: +d.askPx, last_price: last, mark_price: last, index_price: d.idxPx ? +d.idxPx : undefined, open_interest: d.openInterest ? +d.openInterest : undefined, stats: { high: +d.high24h, low: +d.low24h, price_change: open ? (last - open) / open * 100 : undefined, volume: +d.vol24h }, mark_iv: undefined, bid_iv: undefined, ask_iv: undefined, delta: undefined, gamma: undefined, vega: undefined, theta: undefined };
-      tickerDirtyRef.current = true;
-    }
-  };
-
-  const parseBybit = (msg: any) => {
-    const topic: string = msg.topic ?? '';
-    if (topic.startsWith('orderbook.')) {
-      const d = msg.data;
-      const toMap = (arr: string[][]): [number, number][] => arr.map(([p, q]) => [+p, +q]);
-      if (msg.type === 'snapshot') {
-        pendingBidsRef.current = applySnapshot(toMap(d.b));
-        pendingAsksRef.current = applySnapshot(toMap(d.a));
-      } else {
-        pendingBidsRef.current = applyDelta(pendingBidsRef.current, toMap(d.b));
-        pendingAsksRef.current = applyDelta(pendingAsksRef.current, toMap(d.a));
-      }
-      bookDirtyRef.current = true;
-    }
-    if (topic.startsWith('tickers.')) {
-      const d = msg.data;
-      pendingTickerRef.current = { instrument_name: d.symbol, best_bid_price: d.bid1Price ? +d.bid1Price : undefined, best_ask_price: d.ask1Price ? +d.ask1Price : undefined, last_price: d.lastPrice ? +d.lastPrice : undefined, mark_price: d.markPrice ? +d.markPrice : undefined, index_price: d.indexPrice ? +d.indexPrice : undefined, open_interest: d.openInterest ? +d.openInterest : undefined, stats: { high: d.highPrice24h ? +d.highPrice24h : undefined, low: d.lowPrice24h ? +d.lowPrice24h : undefined, price_change: d.price24hPcnt ? +d.price24hPcnt * 100 : undefined, volume: d.volume24h ? +d.volume24h : undefined }, mark_iv: undefined, bid_iv: undefined, ask_iv: undefined, delta: undefined, gamma: undefined, vega: undefined, theta: undefined };
-      tickerDirtyRef.current = true;
-    }
-  };
-
-  const parseDeribit = (msg: any) => {
-    if (msg.method !== 'subscription') return;
-    const channel: string = msg.params?.channel ?? '';
-    const data = msg.params?.data;
-    if (!data) return;
-    if (channel.startsWith('book.')) {
-      if (data.type === 'snapshot') {
-        pendingBidsRef.current = applySnapshot((data.bids as [string, number, number][]).map(([, p, s]) => [p, s]));
-        pendingAsksRef.current = applySnapshot((data.asks as [string, number, number][]).map(([, p, s]) => [p, s]));
-      } else {
-        pendingBidsRef.current = applyDelta(pendingBidsRef.current, (data.bids as [string, number, number][]).map(([t, p, s]) => [p, t === 'delete' ? 0 : s]));
-        pendingAsksRef.current = applyDelta(pendingAsksRef.current, (data.asks as [string, number, number][]).map(([t, p, s]) => [p, t === 'delete' ? 0 : s]));
-      }
-      bookDirtyRef.current = true;
-    }
-    if (channel.startsWith('ticker.')) {
-      pendingTickerRef.current = { instrument_name: data.instrument_name, best_bid_price: data.best_bid_price, best_ask_price: data.best_ask_price, best_bid_amount: data.best_bid_amount, best_ask_amount: data.best_ask_amount, last_price: data.last_price, mark_price: data.mark_price, index_price: data.index_price, open_interest: data.open_interest, stats: { high: data.stats?.high, low: data.stats?.low, price_change: data.stats?.price_change, volume: data.stats?.volume, volume_usd: data.stats?.volume_usd }, mark_iv: data.mark_iv, bid_iv: data.bid_iv, ask_iv: data.ask_iv, delta: data.greeks?.delta, gamma: data.greeks?.gamma, vega: data.greeks?.vega, theta: data.greeks?.theta };
-      tickerDirtyRef.current = true;
-    }
-  };
-
-  const parseCoincall = (msg: any) => {
-    const dt: number = msg?.dt;
-    const d = msg?.d;
-    if (!d) return;
-    if (dt === 32) {
-      const toMap = (arr: { pr: string; sz: string }[]): [number, number][] => (arr ?? []).map(({ pr, sz }) => [+pr, +sz]);
-      pendingBidsRef.current = applySnapshot(toMap(d.bids));
-      pendingAsksRef.current = applySnapshot(toMap(d.asks));
-      bookDirtyRef.current = true;
-    }
-    if (dt === 3) {
-      pendingTickerRef.current = { instrument_name: d.s, best_bid_price: d.bid != null ? +d.bid : undefined, best_ask_price: d.ask != null ? +d.ask : undefined, best_bid_amount: d.bs != null ? +d.bs : undefined, best_ask_amount: d.as != null ? +d.as : undefined, last_price: d.lp != null ? +d.lp : undefined, mark_price: d.mp != null ? +d.mp : undefined, index_price: d.ip != null ? +d.ip : undefined, open_interest: d.oi != null ? +d.oi : undefined, stats: { high: d.h != null ? +d.h : undefined, low: d.l != null ? +d.l : undefined, price_change: d.cr != null ? +d.cr * 100 : undefined, volume: d.v24 != null ? +d.v24 : undefined, volume_usd: d.uv24 != null ? +d.uv24 : undefined }, mark_iv: d.iv != null ? +d.iv : undefined, bid_iv: d.biv != null ? +d.biv : undefined, ask_iv: d.aiv != null ? +d.aiv : undefined, delta: d.delta != null ? +d.delta : undefined, gamma: d.gamma != null ? +d.gamma : undefined, vega: d.vega != null ? +d.vega : undefined, theta: d.theta != null ? +d.theta : undefined };
-      tickerDirtyRef.current = true;
-    }
-    if (dt === 30) {
-      pendingTickerRef.current = { instrument_name: d.s, best_bid_price: undefined, best_ask_price: undefined, last_price: d.pr != null ? +d.pr : undefined, mark_price: d.mp != null ? +d.mp : undefined, index_price: d.ip != null ? +d.ip : undefined, open_interest: d.oi != null ? +d.oi : undefined, stats: { high: d.h != null ? +d.h : undefined, low: d.l != null ? +d.l : undefined, price_change: d.cr != null ? +d.cr * 100 : undefined, volume: d.v24 != null ? +d.v24 : undefined, volume_usd: d.uv24 != null ? +d.uv24 : undefined }, mark_iv: undefined, bid_iv: undefined, ask_iv: undefined, delta: undefined, gamma: undefined, vega: undefined, theta: undefined };
-      tickerDirtyRef.current = true;
-    }
-  };
-
-  // Always-fresh handler — reassigned each render so parsers never go stale
-  handleMessageRef.current = (raw: string) => {
-    try {
-      const msg = JSON.parse(raw);
-      if (account.exchange === 'okx')           parseOkx(msg);
-      else if (account.exchange === 'bybit')    parseBybit(msg);
-      else if (account.exchange === 'coincall') parseCoincall(msg);
-      else                                       parseDeribit(msg);
-    } catch {}
-  };
-
-  const { sendJsonMessage, getWebSocket } = useWebSocket(url, {
-    onOpen: () => {
-      onConnectedChange(true);
-      if (instrument) {
-        subscribedRef.current = instrument;
-        sendJsonMessage(subMsg(account.exchange, instrument, true, kind));
-        if (account.exchange === 'coincall' && kind === 'option')
-          sendJsonMessage({ action: 'subscribe', dataType: 'bsInfo', payload: { symbol: instrument } });
-      }
-    },
-    onClose: () => { onConnectedChange(false); subscribedRef.current = ''; },
-    shouldReconnect: () => true,
-    onMessage: (event) => handleMessageRef.current(event.data),
-  });
-
+  // Subscribe to backend market data via Tauri events.
   useEffect(() => {
-    if (!instrument) return;
-    const ws = getWebSocket();
-    if (!ws || ws.readyState !== WebSocket.OPEN) return;
-    if (subscribedRef.current && subscribedRef.current !== instrument) {
-      sendJsonMessage(subMsg(account.exchange, subscribedRef.current, false, kind));
-      if (account.exchange === 'coincall' && kind === 'option')
-        sendJsonMessage({ action: 'unSubscribe', dataType: 'bsInfo', payload: { symbol: subscribedRef.current } });
+    if (!exchangeSymbol || !symbol) {
+      onConnectedChange(false);
+      return;
     }
+
+    let cancelled = false;
+    const unlisteners: Array<() => void> = [];
+
+    // Reset book / ticker on every new subscription.
     setBids(new Map()); setAsks(new Map()); setTicker(null);
     pendingBidsRef.current = new Map(); pendingAsksRef.current = new Map();
     pendingTickerRef.current = null; bookDirtyRef.current = false; tickerDirtyRef.current = false;
-    subscribedRef.current = instrument;
-    sendJsonMessage(subMsg(account.exchange, instrument, true, kind));
-    if (account.exchange === 'coincall' && kind === 'option')
-      sendJsonMessage({ action: 'subscribe', dataType: 'bsInfo', payload: { symbol: instrument } });
-  }, [instrument]);
 
-  useEffect(() => {
-    const id = setInterval(() => {
-      const ws = getWebSocket();
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        if (account.exchange === 'coincall')
-          (ws as WebSocket).send('{"action":"heartbeat"}');
-        else if (account.exchange !== 'deribit')
-          (ws as WebSocket).send('{"op":"ping"}');
-      }
-    }, 20_000);
-    return () => clearInterval(id);
-  }, [account.exchange]);
+    invoke('subscribe_market_data', {
+      exchange: account.exchange,
+      exchangeSymbol,
+      symbol,
+      kind,
+      accountId: account.exchange === 'coincall' ? account.id : undefined,
+    }).then(() => { if (!cancelled) onConnectedChange(true); }).catch(console.error);
+
+    listen<MarketBookEvent>('market://book', (event) => {
+      const e = event.payload;
+      if (e.symbol !== symbol || e.exchange !== account.exchange) return;
+      const bm = new Map<number, number>();
+      const am = new Map<number, number>();
+      for (const [p, s] of e.bids) bm.set(p, s);
+      for (const [p, s] of e.asks) am.set(p, s);
+      pendingBidsRef.current = bm;
+      pendingAsksRef.current = am;
+      bookDirtyRef.current = true;
+    }).then(u => { if (cancelled) u(); else unlisteners.push(u); });
+
+    listen<MarketTickerEvent>('market://ticker', (event) => {
+      const e = event.payload;
+      if (e.symbol !== symbol || e.exchange !== account.exchange) return;
+      pendingTickerRef.current = {
+        instrument_name: e.exchangeSymbol,
+        best_bid_price:  e.bid,
+        best_ask_price:  e.ask,
+        last_price:      e.last,
+        mark_price:      e.mark,
+        index_price:     e.index,
+        open_interest:   e.openInterest,
+        stats: { high: e.high24h, low: e.low24h, price_change: e.priceChange24h, volume: e.volume24h },
+        mark_iv: e.markIv,
+        bid_iv:  e.bidIv,
+        ask_iv:  e.askIv,
+        delta:   e.delta,
+        gamma:   e.gamma,
+        vega:    e.vega,
+        theta:   e.theta,
+      };
+      tickerDirtyRef.current = true;
+    }).then(u => { if (cancelled) u(); else unlisteners.push(u); });
+
+    return () => {
+      cancelled = true;
+      invoke('unsubscribe_market_data', { exchange: account.exchange, exchangeSymbol }).catch(() => {});
+      for (const u of unlisteners) u();
+      onConnectedChange(false);
+    };
+  }, [symbol, exchangeSymbol, account.exchange, account.id, kind]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const fmtP   = (n: number) => n >= 1000 ? n.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) : n.toFixed(4);
   const fmtN   = (n: number) => n.toLocaleString('en-US', { maximumFractionDigits: 4 });
@@ -729,13 +613,15 @@ const OrderBookPanel: FunctionComponent<OBPanelProps> = memo(({
   const handleTrade = () => {
     dispatch(setActiveAccount(account.id));
     dispatch(setInstruments(rawInstruments));
-    dispatch(setSelectedInstrument(instrument));
+    dispatch(setSelectedInstrument(symbol));
+    dispatch(setExchangeSymbol(exchangeSymbol));
   };
 
   const handleBookRowClick = (price: number, side: 'buy' | 'sell') => {
     dispatch(setActiveAccount(account.id));
     dispatch(setInstruments(rawInstruments));
-    dispatch(setSelectedInstrument(instrument));
+    dispatch(setSelectedInstrument(symbol));
+    dispatch(setExchangeSymbol(exchangeSymbol));
     dispatch(setPriceFromBook({ price, side }));
   };
 
@@ -787,7 +673,7 @@ const OrderBookPanel: FunctionComponent<OBPanelProps> = memo(({
           <span style={{ textAlign: 'right' }}>TOTAL</span>
         </BookHeader>
         {!hasBook ? (
-          <EmptyBook>{instrument ? 'Waiting for data…' : 'Select an instrument'}</EmptyBook>
+          <EmptyBook>{exchangeSymbol ? 'Waiting for data…' : 'Select an instrument'}</EmptyBook>
         ) : (
           <>
             <BookSection $reverse>
@@ -834,8 +720,8 @@ const OrderBookPanel: FunctionComponent<OBPanelProps> = memo(({
       </BookWrapper>
 
       {/* Trade */}
-      <TradeBtn onClick={handleTrade} disabled={!instrument}>
-        ⚡ Trade {instrument || '…'}
+      <TradeBtn onClick={handleTrade} disabled={!exchangeSymbol}>
+        ⚡ Trade {exchangeSymbol || '…'}
       </TradeBtn>
     </>
   );
@@ -871,7 +757,7 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
       setBaseCcy(availableBaseCurrencies[0] ?? 'BTC');
     }
   }, [availableBaseCurrencies]); // eslint-disable-line react-hooks/exhaustive-deps
-  const [rawInstruments, setRawInst]    = useState<Instrument[]>([]);
+  const [rawInstruments, setRawInst]    = useState<ReferenceData[]>([]);
   const [quote, setQuote]               = useState('USD');
   const [selExpiryKey, setSelExpiryKey] = useState('PERP');
   const [strike, setStrike]             = useState<number>(0);
@@ -880,7 +766,7 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
   // Connected state for header ConnDot — bubbled up from OrderBookPanel child
   const [connected, setConnected] = useState(false);
 
-  const instrumentCacheRef = useRef<Map<string, Instrument[]>>(new Map());
+  const instrumentCacheRef = useRef<Map<string, ReferenceData[]>>(new Map());
 
   // Derive settlement: USD-quoted = inverse (coin-margined), else = linear
   const settlement = useMemo((): 'linear' | 'inverse' =>
@@ -889,74 +775,78 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
   // ── Cascading derived selections ──────────────────────────────────────────
 
   const availableQuotes = useMemo(() =>
-    [...new Set(rawInstruments.map(i => i.quote_currency))].sort(),
+    [...new Set(rawInstruments.map(r => r.quote))].sort(),
     [rawInstruments]);
 
-  // For options, quote is irrelevant for selection — filter by expiry/strike directly.
-  // For futures/spot, filter by selected quote currency (USD = inverse, USDT = linear).
   const byQuote = useMemo(() => {
     if (kind === 'option') return rawInstruments;
-    const filtered = rawInstruments.filter(i => i.quote_currency === quote);
+    const filtered = rawInstruments.filter(r => r.quote === quote);
     return filtered.length > 0 ? filtered : rawInstruments;
   }, [rawInstruments, quote, kind]);
 
   const availableExpiries = useMemo((): ExpiryOption[] => {
     const seen = new Set<string>();
     const result: ExpiryOption[] = [];
-    const sorted = [...byQuote].sort((a, b) =>
-      (a.expiration_timestamp ?? 0) - (b.expiration_timestamp ?? 0));
-    for (const inst of sorted) {
-      const key = expiryKey(inst.expiration_timestamp);
-      if (!seen.has(key)) { seen.add(key); result.push({ key, label: formatExpiry(inst.expiration_timestamp) }); }
+    const sorted = [...byQuote].sort((a, b) => {
+      const ak = expiryKey(a), bk = expiryKey(b);
+      if (ak === 'PERP') return -1; if (bk === 'PERP') return 1;
+      return +ak - +bk;
+    });
+    for (const r of sorted) {
+      const key = expiryKey(r);
+      if (!seen.has(key)) { seen.add(key); result.push({ key, label: formatExpiryKey(key) }); }
     }
-    result.sort((a, b) => a.key === 'PERP' ? -1 : b.key === 'PERP' ? 1 : +a.key - +b.key);
     return result;
   }, [byQuote]);
 
   const byExpiry = useMemo(() => {
-    const filtered = byQuote.filter(i => expiryKey(i.expiration_timestamp) === selExpiryKey);
-    // If selExpiryKey doesn't match anything yet, fall back to all instruments in group
+    const filtered = byQuote.filter(r => expiryKey(r) === selExpiryKey);
     return filtered.length > 0 ? filtered : byQuote;
   }, [byQuote, selExpiryKey]);
 
   const availableStrikes = useMemo(() => {
     if (kind !== 'option') return [];
-    return [...new Set(byExpiry.map(i => i.strike).filter((s): s is number => s != null))]
+    return [...new Set(byExpiry.map(r => r.strike).filter((s): s is number => s != null))]
       .sort((a, b) => a - b);
   }, [byExpiry, kind]);
 
-  const instrument = useMemo(() => {
-    if (rawInstruments.length === 0) return '';
-    if (kind === 'spot')   return byQuote[0]?.instrument_name ?? '';
-    if (kind === 'future') return byExpiry[0]?.instrument_name ?? '';
-    // For options: match by exact expiry+strike (byExpiry already filtered by expiry)
-    const exact = byExpiry.find(i => i.strike === strike && normOptType(i.option_type) === optionSide);
-    if (exact) return exact.instrument_name;
-    return byExpiry.find(i => normOptType(i.option_type) === optionSide)?.instrument_name ?? '';
+  // The selected ReferenceData entry
+  const selectedRef = useMemo((): ReferenceData | null => {
+    if (rawInstruments.length === 0) return null;
+    if (kind === 'spot')   return byQuote[0] ?? null;
+    if (kind === 'future') return byExpiry[0] ?? null;
+    const exact = byExpiry.find(r => r.strike === strike && r.optionType === optionSide);
+    if (exact) return exact;
+    return byExpiry.find(r => r.optionType === optionSide) ?? null;
   }, [rawInstruments, kind, byQuote, byExpiry, strike, optionSide]);
+
+  const symbol = selectedRef?.symbol ?? '';
+
+  const exchangeSymbol = useMemo(() => {
+    if (!selectedRef) return '';
+    return selectedRef.venues.find(v => v.exchange === account.exchange)?.exchangeSymbol ?? '';
+  }, [selectedRef, account.exchange]);
 
   // ── Cascade: compute quote→expiry→strike in one pass when instruments load ──
   useEffect(() => {
     if (rawInstruments.length === 0) return;
 
     if (kind === 'option') {
-      // For options: skip quote, go straight to expiry → strike
-      const expiryKeys = [...new Set(rawInstruments.map(i => expiryKey(i.expiration_timestamp)))];
+      const expiryKeys = [...new Set(rawInstruments.map(r => expiryKey(r)))];
       const nonPerp = expiryKeys.filter(k => k !== 'PERP').sort((a, b) => +a - +b);
       const bestExpiry = nonPerp[0] ?? expiryKeys[0] ?? 'PERP';
-      const byE = rawInstruments.filter(i => expiryKey(i.expiration_timestamp) === bestExpiry);
-      const strikes = [...new Set(byE.map(i => i.strike).filter((s): s is number => s != null))]
+      const byE = rawInstruments.filter(r => expiryKey(r) === bestExpiry);
+      const strikes = [...new Set(byE.map(r => r.strike).filter((s): s is number => s != null))]
         .sort((a, b) => a - b);
       setSelExpiryKey(bestExpiry);
       if (strikes.length > 0) setStrike(strikes[0]);
     } else {
-      // For futures/spot: quote first, then expiry
-      const quotes = [...new Set(rawInstruments.map(i => i.quote_currency))].sort();
+      const quotes = [...new Set(rawInstruments.map(r => r.quote))].sort();
       const bestQuote = quotes.includes('USD') ? 'USD'
         : quotes.includes('USDT') ? 'USDT'
         : quotes[0] ?? 'USD';
-      const byQ = rawInstruments.filter(i => i.quote_currency === bestQuote);
-      const expiryKeys = [...new Set(byQ.map(i => expiryKey(i.expiration_timestamp)))];
+      const byQ = rawInstruments.filter(r => r.quote === bestQuote);
+      const expiryKeys = [...new Set(byQ.map(r => expiryKey(r)))];
       const hasPerp = expiryKeys.includes('PERP');
       const nonPerp = expiryKeys.filter(k => k !== 'PERP').sort((a, b) => +a - +b);
       const bestExpiry = hasPerp ? 'PERP' : (nonPerp[0] ?? 'PERP');
@@ -968,8 +858,8 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
   // When user manually changes quote (futures only) → reset expiry
   useEffect(() => {
     if (rawInstruments.length === 0 || kind === 'option') return;
-    const byQ = rawInstruments.filter(i => i.quote_currency === quote);
-    const expiryKeys = [...new Set(byQ.map(i => expiryKey(i.expiration_timestamp)))];
+    const byQ = rawInstruments.filter(r => r.quote === quote);
+    const expiryKeys = [...new Set(byQ.map(r => expiryKey(r)))];
     const hasPerp = expiryKeys.includes('PERP');
     const nonPerp = expiryKeys.filter(k => k !== 'PERP').sort((a, b) => +a - +b);
     setSelExpiryKey(hasPerp ? 'PERP' : (nonPerp[0] ?? 'PERP'));
@@ -978,18 +868,15 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
   // When user manually changes expiry → reset strike (options only)
   useEffect(() => {
     if (rawInstruments.length === 0 || kind !== 'option') return;
-    const src = kind === 'option' ? rawInstruments : rawInstruments.filter(i => i.quote_currency === quote);
-    const byE = src.filter(i => expiryKey(i.expiration_timestamp) === selExpiryKey);
-    const strikes = [...new Set(byE.map(i => i.strike).filter((s): s is number => s != null))]
+    const byE = rawInstruments.filter(r => expiryKey(r) === selExpiryKey);
+    const strikes = [...new Set(byE.map(r => r.strike).filter((s): s is number => s != null))]
       .sort((a, b) => a - b);
     if (strikes.length > 0) setStrike(strikes[0]);
   }, [selExpiryKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Fetch instruments ─────────────────────────────────────────────────────
+  // ── Fetch reference data ──────────────────────────────────────────────────
 
   useEffect(() => {
-    // Reset all cascaded state when the kind or base changes so stale expiry/strike
-    // values don't block the cascade for the newly loaded instruments.
     const cacheKey = `${account.exchange}|${baseCcy}|${kind}`;
     const cached = instrumentCacheRef.current.get(cacheKey);
     if (cached) {
@@ -1000,9 +887,9 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
     setQuote('USD');
     setSelExpiryKey('PERP');
     setStrike(0);
-    invoke<Instrument[]>('fetch_instruments', { exchange: account.exchange, currency: baseCcy, kind })
+    invoke<ReferenceData[]>('fetch_reference_data', { exchange: account.exchange, currency: baseCcy, kind })
       .then(list => {
-        const sorted = [...list].sort((a, b) => a.instrument_name.localeCompare(b.instrument_name));
+        const sorted = [...list].sort((a, b) => a.symbol.localeCompare(b.symbol));
         instrumentCacheRef.current.set(cacheKey, sorted);
         setRawInst(sorted);
       })
@@ -1023,7 +910,7 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
             {settlement === 'inverse' ? 'INV' : 'LIN'}
           </SettleBadge>
         )}
-        {instrument && <InstrLabel title={instrument}>{instrument}</InstrLabel>}
+        {exchangeSymbol && <InstrLabel title={symbol}>{exchangeSymbol}</InstrLabel>}
         <ConnDot $connected={connected} title={connected ? 'Live' : 'Disconnected'} />
       </PanelHeader>
 
@@ -1115,12 +1002,12 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
         )}
       </SelectorsBlock>
 
-      {/* Ticker + Book + Trade button — isolated in memo child so WS re-renders never reach here */}
+      {/* Ticker + Book + Trade button — isolated in memo child so backend events never re-render selectors */}
       <OrderBookPanel
         account={account}
-        instrument={instrument}
+        symbol={symbol}
+        exchangeSymbol={exchangeSymbol}
         kind={kind}
-        settlement={settlement}
         rawInstruments={rawInstruments}
         onConnectedChange={setConnected}
       />

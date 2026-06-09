@@ -87,6 +87,7 @@ async fn run_once(
 
     let mut bids: BookMap = BTreeMap::new();
     let mut asks: BookMap = BTreeMap::new();
+    let mut last_book_emit: i64 = 0;
 
     // Bybit requires a ping every 20s.
     let mut ping_interval = tokio::time::interval(Duration::from_secs(20));
@@ -101,7 +102,7 @@ async fn run_once(
             msg = read.next() => {
                 match msg {
                     Some(Ok(Message::Text(t))) => {
-                        handle_msg(app, exch_sym, symbol, &t, &mut bids, &mut asks);
+                        handle_msg(app, exch_sym, symbol, &t, &mut bids, &mut asks, &mut last_book_emit);
                     }
                     Some(Ok(Message::Ping(d))) => { let _ = write.send(Message::Pong(d)).await; }
                     None | Some(Err(_)) => return Err("disconnected".into()),
@@ -140,6 +141,7 @@ fn handle_msg(
     text: &str,
     bids: &mut BookMap,
     asks: &mut BookMap,
+    last_book_emit: &mut i64,
 ) {
     let v: Value = match serde_json::from_str(text) {
         Ok(v) => v, Err(_) => return,
@@ -153,6 +155,11 @@ fn handle_msg(
         let is_snapshot = msg_type == "snapshot";
         apply_bybit_levels(bids, &data["b"], is_snapshot);
         apply_bybit_levels(asks, &data["a"], is_snapshot);
+
+        // Throttle: emit at most once every 80ms
+        let now = now_ms();
+        if now - *last_book_emit < 80 { return; }
+        *last_book_emit = now;
 
         let bid_levels: Vec<[f64; 2]> = bids.iter().rev().take(MAX_LEVELS)
             .map(|(&k, &s)| [key_price(k), s]).collect();
