@@ -121,6 +121,14 @@ const GeneralTab: FunctionComponent = () => {
               <Input type="number" min={0} max={8} value={general.sizeDecimals}
                 onChange={(e) => update({ sizeDecimals: Number(e.target.value) })} />
             </FormGroup>
+            <FormGroup>
+              <Label>Max Dashboard Widgets</Label>
+              <Input
+                type="number" min={1} max={12}
+                value={general.maxDashboardWidgets ?? 4}
+                onChange={(e) => update({ maxDashboardWidgets: Math.max(1, Math.min(12, Number(e.target.value))) })}
+              />
+            </FormGroup>
           </FormGrid>
         </SectionBody>
       </SectionCard>

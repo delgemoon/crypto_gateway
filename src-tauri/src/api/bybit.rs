@@ -3,10 +3,12 @@ use serde_json::{json, Value};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use crate::api::models::{
     Account, AccountSummary, Instrument, Order, OrderResult, OrderbookLevel, OrderbookSnapshot,
-    PlaceOrderRequest, Position, Ticker, TickerStats, Trade,
+    PlaceOrderRequest, Position, Ticker, TickerStats, Trade, TransactionLog,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -15,12 +17,39 @@ const BYBIT_BASE: &str      = "https://api.bybit.com";
 const BYBIT_TEST_BASE: &str = "https://api-testnet.bybit.com";
 const RECV_WINDOW: u64      = 5000;
 
+/// Millisecond offset: server_time - local_time, updated by sync_server_time().
+static TIME_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
+
 fn base(testnet: bool) -> &'static str {
     if testnet { BYBIT_TEST_BASE } else { BYBIT_BASE }
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+    let local = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+    (local + TIME_OFFSET_MS.load(Ordering::Relaxed)).max(0) as u64
+}
+
+/// Fetch Bybit server time and store the clock offset so all subsequent
+/// requests use a timestamp that matches the exchange.
+pub async fn sync_server_time() {
+    let url = format!("{}/v5/market/time", BYBIT_BASE);
+    if let Ok(resp) = Client::new().get(&url).send().await {
+        if let Ok(v) = resp.json::<Value>().await {
+            let server_ms = v["result"]["timeNano"].as_str()
+                .and_then(|s| s.parse::<i64>().ok())
+                .map(|ns| ns / 1_000_000)
+                .or_else(|| v["result"]["timeSecond"].as_str()
+                    .and_then(|s| s.parse::<i64>().ok())
+                    .map(|s| s * 1000));
+            if let Some(server_ms) = server_ms {
+                let local_ms = SystemTime::now().duration_since(UNIX_EPOCH)
+                    .unwrap_or_default().as_millis() as i64;
+                let offset = server_ms - local_ms;
+                TIME_OFFSET_MS.store(offset, Ordering::Relaxed);
+                eprintln!("[bybit] server time offset: {}ms", offset);
+            }
+        }
+    }
 }
 
 fn sign(msg: &str, secret: &str) -> String {
@@ -594,4 +623,243 @@ pub async fn fetch_orderbook(instrument_name: &str, depth: u32) -> Result<Orderb
     } else {
         Err(resp["retMsg"].as_str().unwrap_or("Unknown Bybit error").to_string())
     }
+}
+
+/// Map Bybit `type` field to canonical transaction_type.
+fn map_bybit_type(t: &str) -> String {
+    match t {
+        "TRADE"               => "trade".to_string(),
+        "SETTLEMENT"          => "settlement".to_string(),
+        "DELIVERY_EXERCISE"   => "delivery".to_string(),
+        "AUTO_DELEVERAGE"     => "delivery".to_string(),
+        "LIQUIDATION"         => "liquidation".to_string(),
+        "TRANSFER_IN"         => "transfer_in".to_string(),
+        "TRANSFER_OUT"        => "transfer_out".to_string(),
+        "INTEREST"            => "interest".to_string(),
+        "FUNDING_FEE"         => "funding".to_string(),
+        "FEE_REFUND"          => "fee_refund".to_string(),
+        "BONUS_INCOME"        => "bonus_income".to_string(),
+        // Unknown types: pass through as-is (lowercased) instead of "other"
+        other                 => other.to_lowercase(),
+    }
+}
+
+/// Extract the base coin from a Bybit symbol for grouping/filtering.
+/// Examples:
+///   "BTCUSDT"               → "BTC"
+///   "BTCUSDC"               → "BTC"
+///   "ETHUSDT"               → "ETH"
+///   "BTCUSD"  (inverse)     → "BTC"
+///   "BTC-10JAN25-50000-C"   → "BTC"
+///   "SOLUSDT-PERP"          → "SOL"
+///   ""                      → "" (pass-through for non-trade entries)
+fn extract_base_coin(symbol: &str) -> String {
+    if symbol.is_empty() { return String::new(); }
+    // Option format: BASE-DDMMMYY-STRIKE-C/P
+    if let Some(pos) = symbol.find('-') {
+        return symbol[..pos].to_string();
+    }
+    // Strip known quote currencies (longest first to avoid partial matches)
+    for quote in &["USDT", "USDC", "BUSD", "USD", "BTC", "ETH"] {
+        if let Some(base) = symbol.strip_suffix(quote) {
+            // Strip optional trailing suffixes like -PERP
+            let base = base.trim_end_matches("-PERP");
+            if !base.is_empty() {
+                return base.to_string();
+            }
+        }
+    }
+    symbol.to_string()
+}
+
+/// Fetch transaction log from Bybit for a given account.
+/// Bybit limits each request to a 7-day window — we chunk the full range automatically.
+/// Enriches entries with markPrice/indexPrice from execution list and
+/// computes per-currency equity by walking backward from current wallet balance.
+pub async fn get_transaction_log(
+    account: &Account,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<TransactionLog>, String> {
+    const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+    let client = Client::new();
+    let mut all_logs: Vec<TransactionLog> = Vec::new();
+
+    // Split the requested range into ≤7-day windows
+    let mut chunk_start = start_ms;
+    while chunk_start < end_ms {
+        let chunk_end = (chunk_start + SEVEN_DAYS_MS).min(end_ms);
+
+        let mut cursor = String::new();
+        loop {
+            let qs = if cursor.is_empty() {
+                format!(
+                    "accountType=UNIFIED&startTime={}&endTime={}&limit=200",
+                    chunk_start, chunk_end
+                )
+            } else {
+                format!(
+                    "accountType=UNIFIED&startTime={}&endTime={}&limit=200&cursor={}",
+                    chunk_start, chunk_end, cursor
+                )
+            };
+            let url = format!("{}/v5/account/transaction-log?{}", base(account.testnet), qs);
+            let headers = auth_get(&account.api_key, &account.api_secret, &qs);
+            let resp: Value = match client.get(&url).headers(headers).send().await {
+                Ok(r) => r.json().await.unwrap_or(Value::Null),
+                Err(e) => return Err(format!("Bybit transaction-log request failed: {}", e)),
+            };
+            if resp["retCode"].as_i64() != Some(0) {
+                let code = resp["retCode"].as_i64().unwrap_or(-1);
+                let msg  = resp["retMsg"].as_str().unwrap_or("unknown");
+                return Err(format!("Bybit transaction-log error {}: {}", code, msg));
+            }
+            let list = match resp["result"]["list"].as_array() {
+                Some(l) => l.clone(),
+                None => break,
+            };
+            for e in &list {
+                let settle_ccy = e["currency"].as_str().unwrap_or("").to_string();
+                let symbol     = e["symbol"].as_str().unwrap_or("");
+                // Use base coin (BTC, ETH, SOL…) for grouping/filtering,
+                // keep settlement currency (USDT, USDC…) in fee_currency.
+                let base_coin  = if symbol.is_empty() {
+                    settle_ccy.clone()
+                } else {
+                    extract_base_coin(symbol)
+                };
+                let side_raw = e["side"].as_str().unwrap_or("None");
+                let side = match side_raw {
+                    "Buy"  => "buy",
+                    "Sell" => "sell",
+                    _      => "",
+                };
+                let ttype = map_bybit_type(e["type"].as_str().unwrap_or(""));
+                all_logs.push(TransactionLog {
+                    id:                 e["id"].as_str().unwrap_or("").to_string(),
+                    timestamp:          e["transactionTime"].as_str()
+                                            .and_then(|s| s.parse::<i64>().ok())
+                                            .unwrap_or(0),
+                    instrument_name:    symbol.to_string(),
+                    transaction_type:   ttype,
+                    side:               side.to_string(),
+                    amount:             e["qty"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    price:              e["tradePrice"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    fee:                e["fee"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    fee_currency:       settle_ccy.clone(),
+                    currency:           base_coin.clone(),
+                    profit_as_cashflow: e["cashFlow"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    balance:            e["cashBalance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    change:             e["change"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    trade_id:           e["tradeId"].as_str().unwrap_or("").to_string(),
+                    order_id:           e["orderId"].as_str().unwrap_or("").to_string(),
+                    info:               String::new(),
+                    mark_price:         0.0,
+                    index_price:        0.0,
+                    // Bybit's cashBalance already IS the post-transaction wallet balance.
+                    // Equity (wallet + unrealized PnL) is not available in the tx log.
+                    equity:             0.0,
+                    position:          e["size" ].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    base_currency:      base_coin.clone(),
+                    quote_currency:     settle_ccy.clone(),
+                });
+            }
+            let next_cursor = resp["result"]["nextPageCursor"].as_str().unwrap_or("").to_string();
+            if next_cursor.is_empty() || list.is_empty() { break; }
+            cursor = next_cursor;
+        }
+
+        chunk_start = chunk_end + 1;
+    }
+
+    all_logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // ── Enrich with mark/index price from execution list ─────────────────────
+    let exec_prices = fetch_execution_prices(account, start_ms, end_ms).await;
+    for log in &mut all_logs {
+        if let Some(&(mark, idx)) = exec_prices.get(&log.order_id) {
+            log.mark_price  = mark;
+            log.index_price = idx;
+        }
+    }
+
+    // ── Backward equity calculation per settlement currency ───────────────────
+    // Group entries by their settlement currency (fee_currency: USDT, USDC, …).
+    // Fetch today's equity for each coin then walk newest→oldest, undoing each
+    // transaction's `change` to reconstruct the running equity at every row.
+    let settle_ccys: Vec<String> = {
+        let mut seen = std::collections::HashSet::new();
+        all_logs.iter()
+            .filter_map(|l| {
+                let c = l.fee_currency.clone();
+                if !c.is_empty() && seen.insert(c.clone()) { Some(c) } else { None }
+            })
+            .collect()
+    };
+    for ccy in &settle_ccys {
+        let current_equity = get_account_summary(ccy, account).await
+            .map(|s| s.equity)
+            .unwrap_or(0.0);
+        if current_equity == 0.0 { continue; }
+        let mut running = current_equity;
+        // all_logs is sorted newest→oldest, so iterating forward walks backward in time
+        for log in all_logs.iter_mut() {
+            if &log.fee_currency == ccy {
+                log.equity = running;
+                running -= log.change; // undo this entry's change to get balance before it
+            }
+        }
+    }
+
+    Ok(all_logs)
+}
+
+/// Build orderId → (markPrice, indexPrice) map from execution list.
+async fn fetch_execution_prices(
+    account: &Account,
+    start_ms: i64,
+    end_ms: i64,
+) -> HashMap<String, (f64, f64)> {
+    const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+    let client = Client::new();
+    let mut map: HashMap<String, (f64, f64)> = HashMap::new();
+
+    for category in &["option", "linear", "inverse"] {
+        let mut chunk_start = start_ms;
+        while chunk_start < end_ms {
+            let chunk_end = (chunk_start + SEVEN_DAYS_MS).min(end_ms);
+            let mut cursor = String::new();
+            loop {
+                let qs = if cursor.is_empty() {
+                    format!("category={}&startTime={}&endTime={}&limit=100", category, chunk_start, chunk_end)
+                } else {
+                    format!("category={}&startTime={}&endTime={}&limit=100&cursor={}", category, chunk_start, chunk_end, cursor)
+                };
+                let url = format!("{}/v5/execution/list?{}", base(account.testnet), qs);
+                let headers = auth_get(&account.api_key, &account.api_secret, &qs);
+                let resp: Value = match client.get(&url).headers(headers).send().await {
+                    Ok(r) => r.json().await.unwrap_or(Value::Null),
+                    Err(_) => break,
+                };
+                if resp["retCode"].as_i64() != Some(0) { break; }
+                let list = match resp["result"]["list"].as_array() {
+                    Some(l) => l.clone(),
+                    None => break,
+                };
+                for e in &list {
+                    let order_id = e["orderId"].as_str().unwrap_or("").to_string();
+                    if !order_id.is_empty() {
+                        let mark  = sf64(&e["markPrice"]).unwrap_or(0.0);
+                        let index = sf64(&e["indexPrice"]).unwrap_or(0.0);
+                        map.entry(order_id).or_insert((mark, index));
+                    }
+                }
+                let next = resp["result"]["nextPageCursor"].as_str().unwrap_or("").to_string();
+                if next.is_empty() || list.is_empty() { break; }
+                cursor = next;
+            }
+            chunk_start = chunk_end + 1;
+        }
+    }
+    map
 }

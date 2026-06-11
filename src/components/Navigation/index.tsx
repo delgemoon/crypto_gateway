@@ -1,7 +1,7 @@
 import { FunctionComponent } from 'react';
 import { NavBar, Brand, NavTab } from './styles';
 
-type View = 'trading' | 'rfq' | 'portfolio' | 'orders' | 'telegram' | 'settings' | 'aggbook';
+type View = 'trading' | 'rfq' | 'portfolio' | 'orders' | 'pnl' | 'telegram' | 'settings' | 'aggbook';
 
 interface NavigationProps {
   currentView: View;
@@ -25,6 +25,9 @@ const Navigation: FunctionComponent<NavigationProps> = ({ currentView, onNavigat
       </NavTab>
       <NavTab $active={currentView === 'orders'} onClick={() => onNavigate('orders')}>
         📋 Orders
+      </NavTab>
+      <NavTab $active={currentView === 'pnl'} onClick={() => onNavigate('pnl')}>
+        💰 PNL
       </NavTab>
       <NavTab $active={currentView === 'aggbook'} onClick={() => onNavigate('aggbook')}>
         📚 Agg Book

@@ -11,6 +11,7 @@ import RfqPanel from "./components/RfqPanel";
 import AccountSummaryPanel from "./components/AccountSummaryPanel";
 import OrdersPanel from "./components/OrdersPanel";
 import AggBook from "./components/AggBook";
+import PnlPanel from "./components/PnlPanel";
 import { useAppDispatch } from './hooks';
 import {
   setAccounts, setClients, setTags, setGeneral, setTelegram,
@@ -30,8 +31,9 @@ import type {
 } from './components/WsManager/wsSlice';
 import { setConfigs, setSnapshot } from './components/AggBook/aggBookSlice';
 import type { AggBookConfig, AggBookSnapshot } from './components/AggBook/aggBookSlice';
+import { initWidgets } from './components/Dashboard/dashboardSlice';
 
-type View = 'trading' | 'rfq' | 'portfolio' | 'orders' | 'telegram' | 'settings' | 'aggbook';
+type View = 'trading' | 'rfq' | 'portfolio' | 'orders' | 'pnl' | 'telegram' | 'settings' | 'aggbook';
 
 const WS_SUPPORTED = ['deribit', 'bybit', 'okx', 'coincall', 'binance', 'mexc', 'hyperliquid'];
 
@@ -100,6 +102,17 @@ function App() {
       if (telegram.status === 'fulfilled') dispatch(setTelegram(telegram.value));
       if (aggConfigs.status === 'fulfilled') dispatch(setConfigs(aggConfigs.value));
 
+      // Initialise dashboard widget visibility once accounts are known
+      if (accs.status === 'fulfilled') {
+        const maxWidgets = general.status === 'fulfilled'
+          ? (general.value.maxDashboardWidgets ?? 4)
+          : 4;
+        dispatch(initWidgets({
+          accounts: accs.value.map(a => ({ id: a.id, exchange: a.exchange })),
+          maxWidgets,
+        }));
+      }
+
       // ── 3. Auto-connect WS for all supported accounts ────────────────────
       if (accs.status === 'fulfilled') {
         for (const acc of accs.value) {
@@ -151,6 +164,7 @@ function App() {
         {view === 'rfq'       && <RfqPanel />}
         {view === 'portfolio'  && <AccountSummaryPanel />}
         {view === 'orders'     && <OrdersPanel />}
+        {view === 'pnl'        && <PnlPanel />}
         {view === 'telegram'  && <TelegramPanel />}
         {view === 'aggbook'   && <AggBook />}
         {view === 'settings'  && <Settings />}

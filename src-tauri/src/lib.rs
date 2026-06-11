@@ -13,7 +13,7 @@ use api::dispatch;
 use api::models::{
     Account, AccountSummary, Broadcast, BroadcastPart, BroadcastSend, Client, ClientInfo, ClientTelegramChat,
     CreateBroadcastRequest, GeneralSettings, Instrument, Order, OrderResult,
-    PlaceOrderRequest, Position, ReferenceData, Tag, Ticker, TelegramSettings, TelegramChat, TelegramResult, Trade,
+    PlaceOrderRequest, Position, ReferenceData, Tag, Ticker, TelegramSettings, TelegramChat, TelegramResult, Trade, TransactionLog,
 };
 use rate_limiter::{RateLimiter, RateLimiterStatus};
 use ws::{WsManager, WsStatusSnapshot};
@@ -242,6 +242,23 @@ async fn get_trade_history(
         }
     }
     Ok(trades)
+}
+
+#[tauri::command]
+async fn get_transaction_log(
+    state: tauri::State<'_, AppState>,
+    account_id: String,
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+) -> Result<Vec<TransactionLog>, String> {
+    let account = db::accounts::find_by_id(&state.pool, &state.enc_key, &account_id)?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+    let s = start_ms.unwrap_or(now_ms - 30 * 24 * 60 * 60 * 1000); // default: last 30 days
+    let e = end_ms.unwrap_or(now_ms);
+    dispatch::get_transaction_log(&account, s, e).await
 }
 
 #[tauri::command]
@@ -999,6 +1016,15 @@ pub fn run() {
                 agg_book_manager,
                 market_manager: MarketDataManager::new(),
             });
+
+            // Sync exchange server times to compensate for local clock drift.
+            tauri::async_runtime::spawn(async {
+                tokio::join!(
+                    api::bybit::sync_server_time(),
+                    api::coincall::sync_server_time(),
+                );
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1033,6 +1059,7 @@ pub fn run() {
             get_open_orders,
             get_all_open_orders,
             get_trade_history,
+            get_transaction_log,
             get_trade_log_path,
             get_account_summary,
             get_positions,

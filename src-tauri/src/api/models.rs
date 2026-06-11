@@ -297,6 +297,61 @@ pub struct Trade {
     pub order_id: String,
 }
 
+// ── Transaction Log ────────────────────────────────────────────────────────
+//
+// Canonical format based on Deribit's `private/get_transaction_log`.
+// Bybit and CoInCall fields are mapped to this structure.
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransactionLog {
+    /// Exchange-generated unique id for this ledger entry
+    pub id: String,
+    /// Unix milliseconds
+    pub timestamp: i64,
+    /// Instrument name (empty for non-trade entries like deposits)
+    pub instrument_name: String,
+    /// "trade" | "delivery" | "settlement" | "transfer_in" | "transfer_out"
+    /// | "deposit" | "withdrawal" | "fee" | "funding" | "option_exercise" | "other"
+    pub transaction_type: String,
+    /// "buy" | "sell" | "" (empty for non-directional entries)
+    pub side: String,
+    /// Trade quantity / transfer amount
+    pub amount: f64,
+    /// Trade price (0 for non-trade entries)
+    pub price: f64,
+    /// Fee charged for this entry (positive = expense)
+    pub fee: f64,
+    /// Currency of the fee
+    pub fee_currency: String,
+    /// Settlement currency of this account (BTC, ETH, USDC, USDT, …)
+    pub currency: String,
+    /// Realised PnL contributed by this entry (Deribit: profit_as_cashflow; Bybit: cashFlow)
+    pub profit_as_cashflow: f64,
+    /// Wallet balance after this entry
+    pub balance: f64,
+    /// Balance change from this entry
+    pub change: f64,
+    /// Exchange-supplied trade id (empty for non-trade entries)
+    pub trade_id: String,
+    /// Exchange-supplied order id
+    pub order_id: String,
+    /// Human-readable extra info / notes
+    pub info: String,
+    /// Mark price at time of entry (0 if not available)
+    pub mark_price: f64,
+    /// Index price at time of entry (0 if not available)
+    pub index_price: f64,
+    /// Account equity after this entry (wallet balance for most exchanges)
+    pub equity: f64,
+    /// Notional position value at time of entry (price × amount, or exchange-supplied)
+    pub position: f64,
+    /// Base currency of the instrument (e.g., BTC)
+    pub base_currency: String,
+    /// Quote currency of the instrument (e.g., USD)
+    pub quote_currency: String,
+}
+
 // ── Place Order Request ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

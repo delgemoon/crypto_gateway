@@ -159,6 +159,19 @@ const ConnDot = styled.span<{ $connected: boolean }>`
   flex-shrink: 0;
 `;
 
+const CloseBtn = styled.button`
+  background: none;
+  border: none;
+  color: #4a5568;
+  font-size: 0.9rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 0.1rem;
+  flex-shrink: 0;
+  transition: color 0.12s;
+  &:hover { color: #d0616e; }
+`;
+
 const SelectorsBlock = styled.div`
   display: flex;
   flex-direction: column;
@@ -736,9 +749,16 @@ const OrderBookPanel: FunctionComponent<OBPanelProps> = memo(({
 
 // ── Component ──────────────────────────────────────────────────────────────
 
-interface Props { account: Account; }
+interface Props {
+  widgetId: string;
+  account: Account;
+  /** All accounts configured for this exchange — drives the account switcher */
+  exchangeAccounts: Account[];
+  onRemove?: () => void;
+  onAccountChange?: (accountId: string) => void;
+}
 
-const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
+const ExchangePanel: FunctionComponent<Props> = ({ account, exchangeAccounts, onRemove, onAccountChange }) => {
   const general   = useAppSelector(selectGeneral);
 
   // Compute filtered base currencies from watchedCoins setting
@@ -910,7 +930,15 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
       {/* Header */}
       <PanelHeader>
         <ExBadge $exchange={account.exchange}>{account.exchange}</ExBadge>
-        <AccountName title={account.name}>{account.name}</AccountName>
+        {exchangeAccounts.length > 1 ? (
+          <TinySelect
+            value={account.id}
+            onChange={onAccountChange ?? (() => {})}
+            options={exchangeAccounts.map(a => ({ value: a.id, label: a.name }))}
+          />
+        ) : (
+          <AccountName title={account.name}>{account.name}</AccountName>
+        )}
         {kind !== 'spot' && (
           <SettleBadge $inverse={settlement === 'inverse'}
             title={settlement === 'inverse' ? 'Coin-margined (Inverse)' : 'USDT-margined (Linear)'}>
@@ -919,6 +947,9 @@ const ExchangePanel: FunctionComponent<Props> = ({ account }) => {
         )}
         {exchangeSymbol && <InstrLabel title={symbol}>{exchangeSymbol}</InstrLabel>}
         <ConnDot $connected={connected} title={connected ? 'Live' : 'Disconnected'} />
+        {onRemove && (
+          <CloseBtn onClick={onRemove} title="Remove widget">×</CloseBtn>
+        )}
       </PanelHeader>
 
       {/* Instrument Selectors */}

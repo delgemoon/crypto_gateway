@@ -65,6 +65,8 @@ export interface GeneralSettings {
   botId: number;
   /** How often the backend emits book/ticker events to the frontend (ms, default 80) */
   bookEmitIntervalMs: number;
+  /** Maximum number of orderbook widgets on the trading dashboard (default 4) */
+  maxDashboardWidgets: number;
 }
 
 // ── Client Info ────────────────────────────────────────────────────────────
@@ -120,6 +122,7 @@ const initialState: SettingsState = {
     watchedCoins: '',
     botId: 1,
     bookEmitIntervalMs: 80,
+    maxDashboardWidgets: 4,
   },
   client: {
     companyName: '',

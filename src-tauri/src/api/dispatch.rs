@@ -1,5 +1,5 @@
 use crate::api::{binance, bullish, bybit, coincall, deribit, hyperliquid, mexc, okx, uniswap};
-use crate::api::models::{Account, AccountSummary, Instrument, Order, OrderResult, OrderbookSnapshot, PlaceOrderRequest, Position, ReferenceData, Ticker, Trade, instrument_to_ref};
+use crate::api::models::{Account, AccountSummary, Instrument, Order, OrderResult, OrderbookSnapshot, PlaceOrderRequest, Position, ReferenceData, Ticker, Trade, TransactionLog, instrument_to_ref};
 
 pub async fn fetch_instruments(exchange: &str, currency: &str, kind: &str, testnet: bool) -> Result<Vec<Instrument>, String> {
     match exchange {
@@ -145,4 +145,35 @@ pub async fn fetch_orderbook(exchange: &str, instrument_name: &str, depth: u32, 
 pub async fn fetch_reference_data(exchange: &str, currency: &str, kind: &str, testnet: bool) -> Result<Vec<ReferenceData>, String> {
     let instruments = fetch_instruments(exchange, currency, kind, testnet).await?;
     Ok(instruments.iter().map(|i| instrument_to_ref(exchange, i)).collect())
+}
+
+/// Fetch transaction log for an account over a date range (milliseconds).
+/// Supported exchanges: deribit, bybit, coincall, bullish.
+pub async fn get_transaction_log(
+    account: &Account,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<TransactionLog>, String> {
+    match account.exchange.as_str() {
+        "deribit" => {
+            // Deribit is per-currency; fetch BTC, ETH, SOL, USDC and merge
+            let currencies = ["BTC", "ETH", "SOL", "USDC"];
+            let mut all: Vec<TransactionLog> = Vec::new();
+            for cur in &currencies {
+                match deribit::get_transaction_log(
+                    &account.api_key, &account.api_secret, account.testnet,
+                    cur, start_ms, end_ms,
+                ).await {
+                    Ok(mut logs) => all.append(&mut logs),
+                    Err(e) => eprintln!("[dispatch] deribit tx_log {}: {}", cur, e),
+                }
+            }
+            all.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            Ok(all)
+        }
+        "bybit"    => bybit::get_transaction_log(account, start_ms, end_ms).await,
+        "coincall" => coincall::get_transaction_log(account, start_ms, end_ms).await,
+        "bullish"  => bullish::get_transaction_log(account, start_ms, end_ms).await,
+        ex => Err(format!("get_transaction_log not supported for {}", ex)),
+    }
 }

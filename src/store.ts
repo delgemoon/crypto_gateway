@@ -4,6 +4,7 @@ import instrumentsReducer from './components/Dashboard/instrumentsSlice';
 import ordersReducer from './components/Dashboard/ordersSlice';
 import wsReducer from './components/WsManager/wsSlice';
 import aggBookReducer from './components/AggBook/aggBookSlice';
+import dashboardReducer from './components/Dashboard/dashboardSlice';
 
 export const store = configureStore({
   reducer: {
@@ -12,6 +13,7 @@ export const store = configureStore({
     orders: ordersReducer,
     ws: wsReducer,
     aggBook: aggBookReducer,
+    dashboard: dashboardReducer,
   },
 });
 

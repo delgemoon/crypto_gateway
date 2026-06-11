@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 use crate::api::models::{
     AccountSummary, AuthToken, Instrument, Order, OrderResult, OrderbookLevel, OrderbookSnapshot,
-    PlaceOrderRequest, Position, Ticker, TickerStats, Trade,
+    PlaceOrderRequest, Position, Ticker, TickerStats, Trade, TransactionLog,
 };
 
 const DERIBIT_BASE: &str = "https://www.deribit.com/api/v2";
@@ -557,4 +557,145 @@ pub async fn fetch_orderbook(instrument_name: &str, depth: u32) -> Result<Orderb
             .to_string();
         Err(err)
     }
+}
+
+/// Fetch transaction log for a single currency from Deribit.
+/// Paginates automatically until all entries within the date range are fetched.
+pub async fn get_transaction_log(
+    api_key: &str,
+    api_secret: &str,
+    testnet: bool,
+    currency: &str,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<TransactionLog>, String> {
+    let token = authenticate(api_key, api_secret, testnet).await?;
+    let client = Client::new();
+    let url = format!("{}/private/get_transaction_log", base_url(testnet));
+
+    let mut logs: Vec<TransactionLog> = Vec::new();
+    let mut continuation: Option<i64> = None;
+
+    loop {
+        let mut params = serde_json::json!({
+            "currency":        currency,
+            "start_timestamp": start_ms,
+            "end_timestamp":   end_ms,
+            "count":           1000,
+        });
+        if let Some(cont) = continuation {
+            params["continuation"] = serde_json::json!(cont);
+        }
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "id": 42,
+            "method": "private/get_transaction_log",
+            "params": params,
+        });
+
+        let resp: Value = client
+            .post(&url)
+            .bearer_auth(&token.access_token)
+            .json(&body)
+            .send().await.map_err(|e| e.to_string())?
+            .json().await.map_err(|e| e.to_string())?;
+
+        if let Some(err) = resp.get("error") {
+            return Err(format!("Deribit transaction_log error: {}", err));
+        }
+
+        let result = &resp["result"];
+        let entries = result["logs"].as_array()
+            .ok_or_else(|| "Deribit: missing logs array".to_string())?;
+
+        // Debug: print first entry so we can verify all field names at runtime
+        if logs.is_empty() {
+            if let Some(first) = entries.first() {
+                eprintln!("[deribit] first tx_log entry (raw): {}", serde_json::to_string(first).unwrap_or_default());
+            }
+        }
+
+        for e in entries {
+            let info = if e["info"].is_object() {
+                serde_json::to_string(&e["info"]).unwrap_or_default()
+            } else {
+                e["info"].as_str().unwrap_or("").to_string()
+            };
+            // Parse a JSON value that could be int, float, or string-encoded number
+            let f64_val = |v: &Value| -> f64 {
+                v.as_f64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    .unwrap_or(0.0)
+            };
+            // Deribit timestamps can be: integer ms, float ms, or integer seconds.
+            // Try "date" first, then "timestamp" as fallback field names.
+            let parse_ts_value = |v: &Value| -> i64 {
+                let raw: i64 = v.as_i64()
+                    .or_else(|| v.as_f64().map(|f| f as i64))
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    .or_else(|| v.as_str().and_then(|s| s.parse::<f64>().ok()).map(|f| f as i64))
+                    .unwrap_or(0);
+                // If the value looks like Unix seconds (10 digits ≤ 9999999999)
+                // multiply by 1000 to get milliseconds.
+                if raw > 0 && raw < 10_000_000_000 { raw * 1000 } else { raw }
+            };
+            let ts = {
+                let v = &e["date"];
+                let candidate = parse_ts_value(v);
+                if candidate != 0 { candidate } else { parse_ts_value(&e["timestamp"]) }
+            };
+            eprintln!("[deribit] date={} timestamp={} -> ts={}", e["date"], e["timestamp"], ts);
+
+            let id_val = {
+                let v = &e["id"];
+                v.as_i64().map(|i| i.to_string())
+                    .or_else(|| v.as_f64().map(|f| (f as i64).to_string()))
+                    .or_else(|| v.as_str().map(|s| s.to_string()))
+                    .unwrap_or_default()
+            };
+            let type_raw = e["type"].as_str().unwrap_or("other");
+            let tx_type = type_raw
+                .replace("transfer_from", "transfer_in")
+                .replace("transfer_to", "transfer_out");
+            // NOTE: Deribit "profit_as_cashflow" is a boolean flag.
+            // The actual realised PnL cash amount is in the "cashflow" field.
+            // "equity" is provided directly by Deribit in this endpoint.
+            logs.push(TransactionLog {
+                id:                 id_val,
+                timestamp:          ts,
+                instrument_name:    e["instrument_name"].as_str().unwrap_or("").to_string(),
+                transaction_type:   tx_type,
+                side:               e["side"].as_str().unwrap_or("").to_string(),
+                amount:             f64_val(&e["amount"]),
+                price:              f64_val(&e["price"]),
+                fee:                f64_val(&e["fees"]),   // Deribit uses "fees" (plural)
+                fee_currency:       currency.to_string(),
+                currency:           currency.to_string(),
+                profit_as_cashflow: f64_val(&e["cashflow"]), // the actual PnL float
+                balance:            f64_val(&e["balance"]),
+                change:             f64_val(&e["change"]),
+                trade_id:           e["trade_id"].as_str().unwrap_or("").to_string(),
+                order_id:           e["order_id"].as_str().unwrap_or("").to_string(),
+                info,
+                mark_price:         f64_val(&e["mark_price"]),
+                index_price:        f64_val(&e["index_price"]),
+                equity:             f64_val(&e["equity"]),  // Deribit provides equity directly
+                position:           f64_val(&e["position"]),
+                base_currency:      e["base_currency"].as_str().unwrap_or("BTC").to_string(),
+                quote_currency:     e["quote_currency"].as_str().unwrap_or("USD").to_string(),
+            });
+        }
+
+        // Deribit returns a continuation token when more pages exist
+        match result.get("continuation") {
+            Some(c) if !c.is_null() => {
+                continuation = c.as_i64();
+                if continuation.is_none() { break; }
+            }
+            _ => break,
+        }
+    }
+
+    logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(logs)
 }

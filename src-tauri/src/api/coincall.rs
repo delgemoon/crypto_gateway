@@ -10,10 +10,12 @@ use serde_json::{json, Value};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicI64, Ordering};
+use chrono::DateTime;
 
 use crate::api::models::{
     Account, AccountSummary, Instrument, Order, OrderResult, OrderbookLevel, OrderbookSnapshot,
-    PlaceOrderRequest, Position, Ticker, TickerStats, Trade,
+    PlaceOrderRequest, Position, Ticker, TickerStats, Trade, TransactionLog,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -22,15 +24,36 @@ const CC_BASE: &str    = "https://api.coincall.com";
 const CC_TEST: &str    = "https://beta.seizeyouralpha.com";
 const TS_DIFF: u64     = 5000;
 
+/// Millisecond offset: server_time - local_time, updated by sync_server_time().
+static TIME_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
+
 fn base(testnet: bool) -> &'static str {
     if testnet { CC_TEST } else { CC_BASE }
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    let local = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64;
+    (local + TIME_OFFSET_MS.load(Ordering::Relaxed)).max(0) as u64
+}
+
+/// Fetch CoInCall server time and store the clock offset so all subsequent
+/// requests use a timestamp that matches the exchange.
+pub async fn sync_server_time() {
+    let url = format!("{}/time", CC_BASE);
+    if let Ok(resp) = Client::new().get(&url).send().await {
+        if let Ok(v) = resp.json::<Value>().await {
+            let server_ms = v["data"]["serverTime"].as_i64()
+                .or_else(|| v["data"].as_i64())
+                .or_else(|| v["timestamp"].as_i64());
+            if let Some(server_ms) = server_ms {
+                let local_ms = SystemTime::now().duration_since(UNIX_EPOCH)
+                    .unwrap_or_default().as_millis() as i64;
+                let offset = server_ms - local_ms;
+                TIME_OFFSET_MS.store(offset, Ordering::Relaxed);
+                eprintln!("[coincall] server time offset: {}ms", offset);
+            }
+        }
+    }
 }
 
 // ── Signing ────────────────────────────────────────────────────────────────
@@ -617,41 +640,86 @@ fn parse_summary_top(d: &Value) -> (f64, f64, f64, f64, f64) {
     (p("equity"), p("availableMargin"), p("imAmount"), p("mmAmount"), p("unrealizedPnL"))
 }
 
-/// Get open positions.
+/// Get open positions (options + futures).
 pub async fn get_positions(_currency: &str, account: &Account) -> Result<Vec<Position>, String> {
     let base_url = base(account.testnet);
-    let uri = "/open/option/position/list/v1";
-    let (headers, _) = auth_get(&account.api_key, &account.api_secret, uri, &[]);
+    let client = Client::new();
+    let mut positions: Vec<Position> = Vec::new();
 
-    let resp: Value = Client::new()
-        .get(&format!("{}{}", base_url, uri))
-        .headers(headers)
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
+    let parse = |v: &Value| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_f64()).unwrap_or(0.0);
 
-    if resp["code"].as_i64() != Some(0) { return Ok(vec![]); }
+    // ── Options positions ────────────────────────────────────────────────────
+    {
+        let uri = "/open/option/position/get/v1";
+        let (headers, _) = auth_get(&account.api_key, &account.api_secret, uri, &[]);
+        if let Ok(resp) = client.get(&format!("{}{}", base_url, uri))
+            .headers(headers).send().await
+        {
+            if let Ok(v) = resp.json::<Value>().await {
+                if v["code"].as_i64() == Some(0) {
+                    if let Some(arr) = v["data"].as_array() {
+                        for p in arr {
+                            let size = parse(&p["qty"]);
+                            if size == 0.0 { continue; }
+                            let trade_side = p["tradeSide"].as_i64().unwrap_or(1);
+                            positions.push(Position {
+                                instrument_name: p["symbol"].as_str().unwrap_or("").to_string(),
+                                direction:       if trade_side == 1 { "long".to_string() } else { "short".to_string() },
+                                size,
+                                average_price:   parse(&p["avgPrice"]),
+                                mark_price:      parse(&p["markPrice"]),
+                                mark_iv:         parse(&p["markIv"]),
+                                unrealized_pnl:  parse(&p["upnl"]),
+                                delta:           parse(&p["delta"]),
+                                gamma:           parse(&p["gamma"]),
+                                theta:           parse(&p["theta"]),
+                                vega:            parse(&p["vega"]),
+                            });
+                        }
+                    }
+                } else {
+                    eprintln!("[coincall] options positions error: {}", v);
+                }
+            }
+        }
+    }
 
-    let positions = resp["data"].as_array()
-        .map(|arr| arr.iter().filter_map(|p| {
-            let parse = |v: &Value| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_f64()).unwrap_or(0.0);
-            let size = parse(&p["qty"]);
-            if size == 0.0 { return None; }
-            let side = p["side"].as_i64().unwrap_or(1); // 1=buy/long, -1=sell/short
-            Some(Position {
-                instrument_name: p["symbol"].as_str().unwrap_or("").to_string(),
-                direction:       if side >= 0 { "long".to_string() } else { "short".to_string() },
-                size,
-                average_price:   parse(&p["openAvgPrice"]),
-                mark_price:      parse(&p["markPrice"]),
-                mark_iv:         parse(&p["markIv"]),
-                unrealized_pnl:  parse(&p["floatingPL"]),
-                delta:           parse(&p["delta"]),
-                gamma:           parse(&p["gamma"]),
-                theta:           parse(&p["theta"]),
-                vega:            parse(&p["vega"]),
-            })
-        }).collect())
-        .unwrap_or_default();
+    // ── Futures positions ────────────────────────────────────────────────────
+    {
+        let uri = "/open/futures/position/get/v1";
+        let (headers, _) = auth_get(&account.api_key, &account.api_secret, uri, &[]);
+        if let Ok(resp) = client.get(&format!("{}{}", base_url, uri))
+            .headers(headers).send().await
+        {
+            if let Ok(v) = resp.json::<Value>().await {
+                if v["code"].as_i64() == Some(0) {
+                    if let Some(arr) = v["data"].as_array() {
+                        for p in arr {
+                            let size = parse(&p["qty"]).abs();
+                            if size == 0.0 { continue; }
+                            let trade_side = p["tradeSide"].as_i64().unwrap_or(1);
+                            positions.push(Position {
+                                instrument_name: p["symbol"].as_str().unwrap_or("").to_string(),
+                                direction:       if trade_side == 1 { "long".to_string() } else { "short".to_string() },
+                                size,
+                                average_price:   parse(&p["avgPrice"]),
+                                mark_price:      parse(&p["markPrice"]),
+                                mark_iv:         0.0,
+                                unrealized_pnl:  parse(&p["upnl"]),
+                                delta:           parse(&p["delta"]),
+                                gamma:           0.0,
+                                theta:           0.0,
+                                vega:            0.0,
+                            });
+                        }
+                    }
+                } else {
+                    eprintln!("[coincall] futures positions error: {}", v);
+                }
+            }
+        }
+    }
+
     Ok(positions)
 }
 
@@ -825,3 +893,687 @@ pub async fn fetch_orderbook(instrument_name: &str, depth: u32, testnet: bool) -
         timestamp: ts,
     })
 }
+
+/// Fetch transaction history from CoInCall, mapping trade history to `TransactionLog`.
+/// Attempts to extract markPrice/indexPrice from the raw response fields.
+/// Backward equity is computed per-currency using current account summary as seed.
+/// Parse ISO-8601 timestamp string to milliseconds (e.g. "2025-01-18T15:36:43.199+00:00").
+fn parse_iso_ms(s: &str) -> i64 {
+    DateTime::parse_from_rfc3339(s)
+        .or_else(|_| DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z"))
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
+}
+
+/// Parse base and quote currency from a CoInCall instrument name.
+/// Handles dashed formats ("BTC-PERP", "BTC-USDT-PERP", "BTC-20231231-30000-C")
+/// and concatenated spot formats ("BTCUSDT").
+fn parse_base_quote(symbol: &str) -> (String, String) {
+    if symbol.is_empty() { return (String::new(), String::new()); }
+    if let Some(dash) = symbol.find('-') {
+        let base = symbol[..dash].to_string();
+        let second_seg = symbol[dash+1..].split('-').next().unwrap_or("");
+        let quote = match second_seg {
+            "USDT" | "USDC" | "USD" | "BTC" | "ETH" | "BUSD" => second_seg.to_string(),
+            _ => "USD".to_string(),
+        };
+        return (base, quote);
+    }
+    for suffix in &["USDT", "USDC", "BUSD", "USD", "BTC", "ETH"] {
+        if symbol.ends_with(suffix) && symbol.len() > suffix.len() {
+            return (symbol[..symbol.len() - suffix.len()].to_string(), suffix.to_string());
+        }
+    }
+    (symbol.to_string(), String::new())
+}
+
+pub async fn get_transaction_log(
+    account: &Account,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<TransactionLog>, String> {
+    let base_url = base(account.testnet);
+    let client = Client::new();
+    let mut logs: Vec<TransactionLog> = Vec::new();
+
+    // ── 1. Trade fills: options + futures + spot ─────────────────────────────
+    {
+        // ── 1a. Options: /open/option/trade/history/v1 ────────────────────────
+        // Pagination via `fromId` cursor; fields: time, tradeSide, price, qty,
+        // fee, markPrice, indexPrice, tradeId, orderId, symbol, feeCurrency
+        {
+            let uri = "/open/option/trade/history/v1";
+            let mut from_id: Option<i64> = None;
+            loop {
+                let mut params: Vec<(&str, String)> = vec![("pageSize", "200".to_string())];
+                if start_ms > 0 { params.push(("startTime", start_ms.to_string())); }
+                if end_ms   > 0 { params.push(("endTime",   end_ms.to_string())); }
+                if let Some(id) = from_id { params.push(("fromId", id.to_string())); }
+
+                let (hdr, qs) = auth_get(&account.api_key, &account.api_secret, uri, &params);
+                let resp: Value = match client.get(&format!("{}{uri}?{qs}", base_url))
+                    .headers(hdr).send().await {
+                        Ok(r) => r.json().await.unwrap_or(Value::Null),
+                        Err(_) => break,
+                    };
+                if resp["code"].as_i64() != Some(0) { break; }
+
+                let list = match resp["data"]["list"].as_array() {
+                    Some(l) if !l.is_empty() => l.clone(),
+                    _ => break,
+                };
+
+                let mut min_id: Option<i64> = None;
+                for t in &list {
+                    let ts = t["time"].as_i64().unwrap_or(0);
+                    if ts < start_ms || ts > end_ms { continue; }
+                    let trade_id = t["tradeId"].as_i64().map(|n| n.to_string())
+                                    .or_else(|| t["tradeId"].as_str().map(|s| s.to_string()))
+                                    .unwrap_or_default();
+                    let order_id = t["orderId"].as_i64().map(|n| n.to_string())
+                                    .or_else(|| t["orderId"].as_str().map(|s| s.to_string()))
+                                    .unwrap_or_default();
+                    let row_id   = t["id"].as_i64().unwrap_or(0);
+                    min_id = Some(min_id.map_or(row_id, |m: i64| m.min(row_id)));
+
+                    let fee_ccy    = t["feeCurrency"].as_str().unwrap_or("USD").to_string();
+                    let mark_price  = t["markPrice"].as_f64().or_else(|| t["markPrice"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0);
+                    let index_price = t["indexPrice"].as_f64().or_else(|| t["indexPrice"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0);
+                    let side = if t["tradeSide"].as_i64().unwrap_or(1) == 1 { "buy" } else { "sell" };
+                    let sym = t["symbol"].as_str().unwrap_or("");
+                    let (base_currency, quote_currency) = parse_base_quote(sym);
+                    logs.push(TransactionLog {
+                        id:                 trade_id.clone(),
+                        timestamp:          ts,
+                        instrument_name:    sym.to_string(),
+                        transaction_type:   "trade".to_string(),
+                        side:               side.to_string(),
+                        amount:             t["qty"].as_f64().unwrap_or(0.0),
+                        price:              t["price"].as_f64().unwrap_or(0.0),
+                        fee:                t["fee"].as_f64().unwrap_or(0.0),
+                        fee_currency:       fee_ccy.clone(),
+                        currency:           fee_ccy,
+                        profit_as_cashflow: 0.0,
+                        balance:            0.0,
+                        change:             0.0,
+                        trade_id,
+                        order_id,
+                        info:               String::new(),
+                        mark_price,
+                        index_price,
+                        equity:             0.0,
+                        position:           t["qty"].as_f64().unwrap_or(0.0) * t["price"].as_f64().unwrap_or(0.0),
+                        base_currency,
+                        quote_currency,
+                    });
+                }
+
+                let has_next = resp["data"]["hasNext"].as_bool().unwrap_or(false);
+                if !has_next || min_id.is_none() { break; }
+                from_id = min_id; // next page starts from the smallest id seen
+            }
+        }
+
+        // ── 1b. Futures:/open/futures/trade/history/v1 ───────────────────────
+        // Same pagination style; fields: time, tradeSide, price, qty, fee,
+        // markPrice, indexPrice, tradeId, orderId, symbol
+        {
+            let uri = "/open/futures/trade/history/v1";
+            let mut from_id: Option<i64> = None;
+            loop {
+                let mut params: Vec<(&str, String)> = vec![("pageSize", "200".to_string())];
+                if start_ms > 0 { params.push(("startTime", start_ms.to_string())); }
+                if end_ms   > 0 { params.push(("endTime",   end_ms.to_string())); }
+                if let Some(id) = from_id { params.push(("fromId", id.to_string())); }
+
+                let (hdr, qs) = auth_get(&account.api_key, &account.api_secret, uri, &params);
+                let resp: Value = match client.get(&format!("{}{uri}?{qs}", base_url))
+                    .headers(hdr).send().await {
+                        Ok(r) => r.json().await.unwrap_or(Value::Null),
+                        Err(_) => break,
+                    };
+                if resp["code"].as_i64() != Some(0) { break; }
+
+                let list = match resp["data"]["list"].as_array() {
+                    Some(l) if !l.is_empty() => l.clone(),
+                    _ => break,
+                };
+
+                let mut min_id: Option<i64> = None;
+                for t in &list {
+                    let ts = t["time"].as_i64().unwrap_or(0);
+                    if ts < start_ms || ts > end_ms { continue; }
+                    let trade_id = t["tradeId"].as_i64().map(|n| n.to_string())
+                                    .or_else(|| t["tradeId"].as_str().map(|s| s.to_string()))
+                                    .unwrap_or_default();
+                    let order_id = t["orderId"].as_i64().map(|n| n.to_string())
+                                    .or_else(|| t["orderId"].as_str().map(|s| s.to_string()))
+                                    .unwrap_or_default();
+                    let row_id   = t["id"].as_i64().unwrap_or(0);
+                    min_id = Some(min_id.map_or(row_id, |m: i64| m.min(row_id)));
+
+                    let mark_price  = t["markPrice"].as_f64().or_else(|| t["markPrice"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0);
+                    let index_price = t["indexPrice"].as_f64().or_else(|| t["indexPrice"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0);
+                    let side = if t["tradeSide"].as_i64().unwrap_or(1) == 1 { "buy" } else { "sell" };
+                    let sym = t["symbol"].as_str().unwrap_or("");
+                    let (base_currency, quote_currency) = parse_base_quote(sym);
+                    logs.push(TransactionLog {
+                        id:                 trade_id.clone(),
+                        timestamp:          ts,
+                        instrument_name:    sym.to_string(),
+                        transaction_type:   "trade".to_string(),
+                        side:               side.to_string(),
+                        amount:             t["qty"].as_f64().unwrap_or(0.0),
+                        price:              t["price"].as_f64().unwrap_or(0.0),
+                        fee:                t["fee"].as_f64().unwrap_or(0.0),
+                        fee_currency:       "USD".to_string(),
+                        currency:           "USD".to_string(),
+                        profit_as_cashflow: 0.0,
+                        balance:            0.0,
+                        change:             0.0,
+                        trade_id,
+                        order_id,
+                        info:               String::new(),
+                        mark_price,
+                        index_price,
+                        equity:             0.0,
+                        position:           t["qty"].as_f64().unwrap_or(0.0) * t["price"].as_f64().unwrap_or(0.0),
+                        base_currency,
+                        quote_currency,
+                    });
+                }
+
+                let has_next = resp["data"]["hasNext"].as_bool().unwrap_or(false);
+                if !has_next || min_id.is_none() { break; }
+                from_id = min_id;
+            }
+        }
+
+        // ── 1c. Spot: /open/spot/trade/fills/v1 ───────────────────────────────
+        // Time-range based pagination; fields: ts, tradeSide, price, qty, fee,
+        // feeCurrency, tradeId, orderId, symbol (limit up to 1000)
+        {
+            let uri = "/open/spot/trade/fills/v1";
+            let params: Vec<(&str, String)> = vec![
+                ("limit",     "1000".to_string()),
+                ("startTime", start_ms.to_string()),
+                ("endTime",   end_ms.to_string()),
+            ];
+            let (hdr, qs) = auth_get(&account.api_key, &account.api_secret, uri, &params);
+            let resp: Value = match client.get(&format!("{}{uri}?{qs}", base_url))
+                .headers(hdr).send().await {
+                    Ok(r) => r.json().await.unwrap_or(Value::Null),
+                    Err(_) => Value::Null,
+                };
+            if resp["code"].as_i64() == Some(0) {
+                for t in resp["data"].as_array().unwrap_or(&vec![]) {
+                    let ts = t["ts"].as_i64().unwrap_or(0);
+                    if ts < start_ms || ts > end_ms { continue; }
+                    let trade_id = t["tradeId"].as_str().map(|s| s.to_string())
+                                    .or_else(|| t["tradeId"].as_i64().map(|n| n.to_string()))
+                                    .unwrap_or_default();
+                    let order_id = t["orderId"].as_i64().map(|n| n.to_string())
+                                    .or_else(|| t["orderId"].as_str().map(|s| s.to_string()))
+                                    .unwrap_or_default();
+                    let fee_ccy = t["feeCurrency"].as_str().unwrap_or("").to_string();
+                    let symbol  = t["symbol"].as_str().unwrap_or("");
+                    // For spot, currency is the base coin (extracted from feeCurrency or symbol)
+                    let base_ccy = if !fee_ccy.is_empty() { fee_ccy.clone() } else { symbol.to_string() };
+                    let side = if t["tradeSide"].as_i64().unwrap_or(1) == 1 { "buy" } else { "sell" };
+                    let (base_currency, quote_currency) = parse_base_quote(symbol);
+                    logs.push(TransactionLog {
+                        id:                 trade_id.clone(),
+                        timestamp:          ts,
+                        instrument_name:    symbol.to_string(),
+                        transaction_type:   "trade".to_string(),
+                        side:               side.to_string(),
+                        amount:             t["qty"].as_f64().or_else(|| t["qty"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0),
+                        price:              t["price"].as_f64().or_else(|| t["price"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0),
+                        fee:                t["fee"].as_f64().or_else(|| t["fee"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0),
+                        fee_currency:       fee_ccy,
+                        currency:           base_ccy,
+                        profit_as_cashflow: 0.0,
+                        balance:            0.0,
+                        change:             0.0,
+                        trade_id,
+                        order_id,
+                        info:               String::new(),
+                        mark_price:         0.0,
+                        index_price:        0.0,
+                        equity:             0.0,
+                        position:           t["qty"].as_f64().or_else(|| t["qty"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0) * t["price"].as_f64().or_else(|| t["price"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0),
+                        base_currency,
+                        quote_currency,
+                    });
+                }
+            }
+        }
+    }
+
+    // ── 2. Deposit / Withdrawal history ─────────────────────────────────────
+    {
+        let mut page = 1u32;
+        loop {
+            let params: Vec<(&str, String)> = vec![
+                ("type",      "-1".to_string()),     // -1 = all (deposit + withdrawal)
+                ("page",      page.to_string()),
+                ("pageSize",  "50".to_string()),
+                ("startTime", start_ms.to_string()),
+                ("endTime",   end_ms.to_string()),
+            ];
+            let (hdr, qs) = auth_get(&account.api_key, &account.api_secret, "/open/account/historyList/v1", &params);
+            let resp: Value = match client.get(&format!("{}/open/account/historyList/v1?{}", base_url, qs))
+                .headers(hdr).send().await {
+                    Ok(r) => r.json().await.unwrap_or(Value::Null),
+                    Err(_) => break,
+                };
+
+            if resp["code"].as_i64() != Some(0) { break; }
+
+            let list = match resp["data"]["list"].as_array() {
+                Some(l) => l.clone(),
+                None    => break,
+            };
+            if list.is_empty() { break; }
+
+            for entry in &list {
+                let ts = entry["createTime"].as_str()
+                    .map(|s| parse_iso_ms(s))
+                    .or_else(|| entry["createTime"].as_i64())
+                    .unwrap_or(0);
+                if ts < start_ms || ts > end_ms { continue; }
+
+                let side_str = entry["side"].as_str().unwrap_or("deposit");
+                let tx_type = if side_str == "withdraw" { "transfer_out" } else { "transfer_in" };
+                let coin = entry["coin"].as_str().unwrap_or("").to_string();
+                let id = entry["transactionRecordId"].as_i64()
+                    .map(|n| n.to_string())
+                    .or_else(|| entry["transactionRecordId"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_default();
+                let info = format!(
+                    "network={} status={} txId={}",
+                    entry["network"].as_str().unwrap_or(""),
+                    entry["status"].as_str().unwrap_or(""),
+                    entry["txId"].as_str().unwrap_or(""),
+                );
+                logs.push(TransactionLog {
+                    id:                 id.clone(),
+                    timestamp:          ts,
+                    instrument_name:    coin.clone(),
+                    transaction_type:   tx_type.to_string(),
+                    side:               side_str.to_string(),
+                    amount:             entry["amount"].as_f64().unwrap_or(0.0),
+                    price:              0.0,
+                    fee:                entry["serviceFee"].as_f64().unwrap_or(0.0),
+                    fee_currency:       coin.clone(),
+                    currency:           coin.clone(),
+                    profit_as_cashflow: 0.0,
+                    balance:            0.0,
+                    change:             0.0,
+                    trade_id:           String::new(),
+                    order_id:           String::new(),
+                    info,
+                    mark_price:         0.0,
+                    index_price:        0.0,
+                    equity:             0.0,
+                    position:           0.0,
+                    base_currency:      coin,
+                    quote_currency:     String::new(),
+                });
+            }
+
+            // Check if there are more pages
+            let total: u32 = resp["data"]["total"].as_u64().unwrap_or(0) as u32;
+            let fetched_so_far = (page * 50) as u32;
+            if list.len() < 50 || fetched_so_far >= total { break; }
+            page += 1;
+        }
+    }
+
+    // ── 3. System transfer records (internal credits, transfers, bonuses) ────
+    {
+        let mut page = 1u32;
+        loop {
+            let params: Vec<(&str, String)> = vec![
+                ("page",      page.to_string()),
+                ("pageSize",  "50".to_string()),
+                ("startTime", start_ms.to_string()),
+                ("endTime",   end_ms.to_string()),
+            ];
+            let (hdr, qs) = auth_get(&account.api_key, &account.api_secret, "/open/account/sysTransferRecords/v1", &params);
+            let resp: Value = match client.get(&format!("{}/open/account/sysTransferRecords/v1?{}", base_url, qs))
+                .headers(hdr).send().await {
+                    Ok(r) => r.json().await.unwrap_or(Value::Null),
+                    Err(_) => break,
+                };
+
+            if resp["code"].as_i64() != Some(0) { break; }
+
+            let list = match resp["data"]["list"].as_array() {
+                Some(l) => l.clone(),
+                None    => break,
+            };
+            if list.is_empty() { break; }
+
+            for entry in &list {
+                let ts = entry["time"].as_i64().unwrap_or(0);
+                if ts < start_ms || ts > end_ms { continue; }
+
+                // type: 0=CREDIT, 1=REWARDS, 2=transfer, 3=Trail Bonus, 4=Release Trail Bonus
+                let raw_type = entry["type"].as_i64().unwrap_or(2);
+                let tx_type = match raw_type {
+                    0 => "credit",
+                    1 => "rewards",
+                    3 | 4 => "bonus",
+                    _ => {
+                        // side: 0=increase (transfer_in), 1=decrease (transfer_out)
+                        if entry["side"].as_i64().unwrap_or(0) == 0 { "transfer_in" } else { "transfer_out" }
+                    }
+                };
+                let side_str = if entry["side"].as_i64().unwrap_or(0) == 0 { "in" } else { "out" };
+                let coin = entry["coin"].as_str().unwrap_or("").to_string();
+                let tx_id = entry["txId"].as_str().map(|s| s.to_string())
+                    .or_else(|| entry["txId"].as_i64().map(|n| n.to_string()))
+                    .unwrap_or_default();
+                let note = entry["note"].as_str().unwrap_or("").to_string();
+
+                logs.push(TransactionLog {
+                    id:                 tx_id.clone(),
+                    timestamp:          ts,
+                    instrument_name:    coin.clone(),
+                    transaction_type:   tx_type.to_string(),
+                    side:               side_str.to_string(),
+                    amount:             entry["creditChange"].as_f64().unwrap_or(0.0),
+                    price:              0.0,
+                    fee:                0.0,
+                    fee_currency:       coin.clone(),
+                    currency:           coin.clone(),
+                    profit_as_cashflow: 0.0,
+                    balance:            0.0,
+                    change:             0.0,
+                    trade_id:           String::new(),
+                    order_id:           String::new(),
+                    info:               note,
+                    mark_price:         0.0,
+                    index_price:        0.0,
+                    equity:             0.0,
+                    position:           0.0,
+                    base_currency:      coin,
+                    quote_currency:     String::new(),
+                });
+            }
+
+            let total: u32 = resp["data"]["total"].as_u64().unwrap_or(0) as u32;
+            let fetched_so_far = (page * 50) as u32;
+            if list.len() < 50 || fetched_so_far >= total { break; }
+            page += 1;
+        }
+    }
+
+    // ── 4. Futures funding rate records (/open/settle/future/record/v1) ────────
+    // Response: { list: [{ id, symbol, tradeSide, qty, fundFee, fundRate, ctime }] }
+    {
+        let uri = "/open/settle/future/record/v1";
+        let mut page = 1u32;
+        loop {
+            let params: Vec<(&str, String)> = vec![
+                ("page",      page.to_string()),
+                ("pageSize",  "50".to_string()),
+                ("startTime", start_ms.to_string()),
+                ("endTime",   end_ms.to_string()),
+            ];
+            let (hdr, qs) = auth_get(&account.api_key, &account.api_secret, uri, &params);
+            let resp: Value = match client.get(&format!("{}{uri}?{qs}", base_url))
+                .headers(hdr).send().await {
+                    Ok(r) => r.json().await.unwrap_or(Value::Null),
+                    Err(_) => break,
+                };
+            if resp["code"].as_i64() != Some(0) { break; }
+            let list = match resp["data"]["list"].as_array() {
+                Some(l) if !l.is_empty() => l.clone(),
+                _ => break,
+            };
+            for e in &list {
+                let ts = e["ctime"].as_i64().unwrap_or(0);
+                if ts < start_ms || ts > end_ms { continue; }
+                let id = e["id"].as_i64().map(|n| n.to_string()).unwrap_or_default();
+                let symbol = e["symbol"].as_str().unwrap_or("").to_string();
+                let fund_fee = e["fundFee"].as_f64().unwrap_or(0.0);
+                let fund_rate = e["fundRate"].as_f64().unwrap_or(0.0);
+                let side = if e["tradeSide"].as_i64().unwrap_or(1) == 1 { "buy" } else { "sell" };
+                let (base_currency, quote_currency) = parse_base_quote(&symbol);
+                logs.push(TransactionLog {
+                    id,
+                    timestamp:          ts,
+                    instrument_name:    symbol,
+                    transaction_type:   "funding".to_string(),
+                    side:               side.to_string(),
+                    amount:             e["qty"].as_f64().unwrap_or(0.0),
+                    price:              0.0,
+                    fee:                0.0,
+                    fee_currency:       "USD".to_string(),
+                    currency:           "USD".to_string(),
+                    profit_as_cashflow: fund_fee,  // funding fee paid/received
+                    balance:            0.0,
+                    change:             fund_fee,
+                    trade_id:           String::new(),
+                    order_id:           String::new(),
+                    info:               format!("fundRate={}", fund_rate),
+                    mark_price:         0.0,
+                    index_price:        0.0,
+                    equity:             0.0,
+                    position:           0.0,
+                    base_currency,
+                    quote_currency,
+                });
+            }
+            let total: u32 = resp["data"]["total"].as_u64().unwrap_or(0) as u32;
+            if list.len() < 50 || (page * 50) >= total { break; }
+            page += 1;
+        }
+    }
+
+    // ── 5. Futures delivery settlement(/open/futures/delivery/settlement/history/v1)
+    // Response: { list: [{ symbol, time, qty, tradeSide, entryPrice,
+    //                      settlementPrice, settlementPnL, netCashFlow, fees }] }
+    {
+        let uri = "/open/futures/delivery/settlement/history/v1";
+        let mut page = 1u32;
+        loop {
+            let params: Vec<(&str, String)> = vec![
+                ("page",      page.to_string()),
+                ("pageSize",  "50".to_string()),
+                ("startTime", start_ms.to_string()),
+                ("endTime",   end_ms.to_string()),
+            ];
+            let (hdr, qs) = auth_get(&account.api_key, &account.api_secret, uri, &params);
+            let resp: Value = match client.get(&format!("{}{uri}?{qs}", base_url))
+                .headers(hdr).send().await {
+                    Ok(r) => r.json().await.unwrap_or(Value::Null),
+                    Err(_) => break,
+                };
+            if resp["code"].as_i64() != Some(0) { break; }
+            let list = match resp["data"]["list"].as_array() {
+                Some(l) if !l.is_empty() => l.clone(),
+                _ => break,
+            };
+            for e in &list {
+                let ts = e["time"].as_i64().unwrap_or(0);
+                if ts < start_ms || ts > end_ms { continue; }
+                let symbol = e["symbol"].as_str().unwrap_or("").to_string();
+                // netCashFlow = actual cash P&L after fees; fall back to settlementPnL
+                let net_cash = e["netCashFlow"].as_f64()
+                    .or_else(|| e["settlementPnL"].as_f64())
+                    .unwrap_or(0.0);
+                let fee  = e["fees"].as_f64().or_else(|| e["fee"].as_f64()).unwrap_or(0.0);
+                let side = if e["tradeSide"].as_i64().unwrap_or(1) == 1 { "buy" } else { "sell" };
+                let qty   = e["qty"].as_f64().unwrap_or(0.0);
+                let price = e["settlementPrice"].as_f64().unwrap_or(0.0);
+                let (base_currency, quote_currency) = parse_base_quote(&symbol);
+                logs.push(TransactionLog {
+                    id:                 format!("settle-{}-{}", symbol, ts),
+                    timestamp:          ts,
+                    instrument_name:    symbol,
+                    transaction_type:   "delivery".to_string(),
+                    side:               side.to_string(),
+                    amount:             qty,
+                    price,
+                    fee,
+                    fee_currency:       "USD".to_string(),
+                    currency:           "USD".to_string(),
+                    profit_as_cashflow: net_cash,
+                    balance:            0.0,
+                    change:             net_cash,
+                    trade_id:           String::new(),
+                    order_id:           String::new(),
+                    info:               format!("entryPrice={}", e["entryPrice"].as_f64().unwrap_or(0.0)),
+                    mark_price:         0.0,
+                    index_price:        0.0,
+                    equity:             0.0,
+                    position:           price * qty,
+                    base_currency,
+                    quote_currency,
+                });
+            }
+            let total: u32 = resp["data"]["total"].as_u64().unwrap_or(0) as u32;
+            if list.len() < 50 || (page * 50) >= total { break; }
+            page += 1;
+        }
+    }
+
+    // ── 6. Options exercise records (/open/settle/exercise/history/v1) ─────────
+    // Response: { id, symbol/instrumentName/optionName, exerciseTime/ctime/time,
+    //             tradeSide, qty, exercisePrice, netCashFlow, fees/fee }
+    {
+        let uri = "/open/settle/exercise/history/v1";
+        let mut page = 1u32;
+        loop {
+            let params: Vec<(&str, String)> = vec![
+                ("page",      page.to_string()),
+                ("pageSize",  "50".to_string()),
+                ("startTime", start_ms.to_string()),
+                ("endTime",   end_ms.to_string()),
+            ];
+            let (hdr, qs) = auth_get(&account.api_key, &account.api_secret, uri, &params);
+            let resp: Value = match client.get(&format!("{}{uri}?{qs}", base_url))
+                .headers(hdr).send().await {
+                    Ok(r) => r.json().await.unwrap_or(Value::Null),
+                    Err(_) => break,
+                };
+            if resp["code"].as_i64() != Some(0) { break; }
+            let list = match resp["data"]["list"].as_array() {
+                Some(l) if !l.is_empty() => l.clone(),
+                _ => break,
+            };
+            for e in &list {
+                eprintln!("Debug: raw exercise record: {}", e);
+                let ts = e["exerciseTime"].as_i64()
+                    .or_else(|| e["ctime"].as_i64())
+                    .or_else(|| e["time"].as_i64())
+                    .unwrap_or(0);
+                if ts < start_ms || ts > end_ms { continue; }
+
+                let symbol = e["symbol"].as_str()
+                    .or_else(|| e["instrumentName"].as_str())
+                    .or_else(|| e["optionName"].as_str())
+                    .unwrap_or("").to_string();
+                // netCashFlow is the actual realised P&L cash amount after fees
+                let net_cash = e["netCashFlow"].as_f64()
+                    .or_else(|| e["pnl"].as_f64())
+                    .or_else(|| e["profit"].as_f64())
+                    .or_else(|| e["settlementPnL"].as_f64())
+                    .unwrap_or(0.0);
+                let fee = e["fees"].as_f64().or_else(|| e["fee"].as_f64()).unwrap_or(0.0);
+                // qty → amount
+                let amount = e["qty"].as_f64().or_else(|| e["amount"].as_f64()).unwrap_or(0.0);
+                // exercisePrice is the canonical price field
+                let price = e["exercisePrice"].as_f64()
+                    .or_else(|| e["settlementPrice"].as_f64())
+                    .unwrap_or(0.0);
+                let id = e["id"].as_i64().map(|n| n.to_string())
+                    .or_else(|| e["exerciseId"].as_str().map(|s| s.to_string()))
+                    .unwrap_or_else(|| format!("ex-{}-{}", symbol, ts));
+                let side = match e["tradeSide"].as_i64().unwrap_or(0) {
+                    1 => "buy", 2 => "sell", _ => "",
+                };
+                let (base_currency, quote_currency) = parse_base_quote(&symbol);
+                logs.push(TransactionLog {
+                    id,
+                    timestamp:          ts,
+                    instrument_name:    symbol,
+                    transaction_type:   "delivery".to_string(),
+                    side:               side.to_string(),
+                    amount,
+                    price,
+                    fee,
+                    fee_currency:       "USD".to_string(),
+                    currency:           "USD".to_string(),
+                    profit_as_cashflow: net_cash,
+                    balance:            0.0,
+                    change:             net_cash,
+                    trade_id:           String::new(),
+                    order_id:           String::new(),
+                    info:               String::new(),
+                    mark_price:         0.0,
+                    index_price:        0.0,
+                    equity:             0.0,
+                    position:           price * amount,
+                    base_currency,
+                    quote_currency,
+                });
+            }
+            let total: u32 = resp["data"]["total"].as_u64().unwrap_or(0) as u32;
+            if list.len() < 50 || (page * 50) >= total { break; }
+            page += 1;
+        }
+    }
+
+    logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+    // ── Backward balance + equity reconstruction ─────────────────────────────
+    // equity  = top-level `equity`           from /open/account/summary/v1
+    // balance = top-level `totalDollarValue` from /open/account/summary/v1
+    // Walk newest→oldest undoing each entry's `change` to reconstruct both.
+    if let Ok((seed_equity, seed_balance)) = fetch_account_totals(account).await {
+        let mut running_equity  = seed_equity;
+        let mut running_balance = seed_balance;
+        for log in logs.iter_mut() {
+            log.equity  = running_equity;
+            log.balance = running_balance;
+            let delta = if log.change != 0.0 { log.change } else { -log.fee };
+            running_equity  -= delta;
+            running_balance -= delta;
+        }
+    }
+
+    Ok(logs)
+}
+
+/// Fetch top-level account totals: (equity, totalDollarValue).
+/// `equity`          = account-level net equity in USD
+/// `totalDollarValue`= total wallet value in USD (used as "balance" seed)
+async fn fetch_account_totals(account: &Account) -> Result<(f64, f64), String> {
+    let base_url = base(account.testnet);
+    let uri = "/open/account/summary/v1";
+    let (headers, _) = auth_get(&account.api_key, &account.api_secret, uri, &[]);
+
+    let resp: Value = Client::new()
+        .get(&format!("{}{}", base_url, uri))
+        .headers(headers)
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+
+    if resp["code"].as_i64() != Some(0) {
+        return Err(resp["msg"].as_str().unwrap_or("CoInCall error").to_string());
+    }
+
+    let d = &resp["data"];
+    let parse = |key: &str| -> f64 {
+        d[key].as_f64()
+            .or_else(|| d[key].as_str().and_then(|s| s.parse().ok()))
+            .unwrap_or(0.0)
+    };
+
+    Ok((parse("equity"), parse("totalDollarValue")))
+}
+

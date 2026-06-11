@@ -22,6 +22,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::api::models::{
     Account, AccountSummary, Instrument, Order, OrderResult, OrderbookLevel,
     OrderbookSnapshot, PlaceOrderRequest, Position, Ticker, TickerStats, Trade,
+    TransactionLog,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -474,4 +475,99 @@ pub async fn get_trade_history(account: &Account, start_ms: i64, end_ms: i64) ->
 pub async fn get_positions(_currency: &str, _account: &Account) -> Result<Vec<Position>, String> {
     // Bullish is a spot exchange — no derivatives positions
     Ok(vec![])
+}
+
+/// Extract base coin from a Bullish spot symbol, e.g. "BTCUSDT" → "BTC".
+fn extract_base(symbol: &str) -> String {
+    // Known quote suffixes, longest first so "USDT" beats "USD"
+    for suffix in &["USDC", "USDT", "BUSD", "USD", "BTC", "ETH", "BNB"] {
+        if symbol.ends_with(suffix) && symbol.len() > suffix.len() {
+            return symbol[..symbol.len() - suffix.len()].to_string();
+        }
+    }
+    symbol.to_string()
+}
+
+/// Fetch trade fills as a canonical transaction log.
+/// Bullish is spot-only so there is no dedicated ledger endpoint;
+/// fills are the closest equivalent.
+pub async fn get_transaction_log(
+    account: &Account,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<TransactionLog>, String> {
+    let jwt                = get_jwt(&account.api_key, &account.api_secret).await?;
+    let trading_account_id = get_trading_account_id(account).await?;
+    let client = Client::new();
+    let mut logs: Vec<TransactionLog> = Vec::new();
+    // Paginate using `createdAfter` + the timestamp of the last fill seen.
+    let mut after_ms = start_ms;
+
+    loop {
+        let url = format!(
+            "{}/trading-api/v2/fills?tradingAccountId={}&createdAfter={}&limit=200",
+            BASE, trading_account_id, after_ms
+        );
+        let resp: Value = client.get(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", jwt))
+            .send().await.map_err(|e| e.to_string())?
+            .json().await.map_err(|e| e.to_string())?;
+
+        let arr = resp["data"].as_array()
+            .or_else(|| resp.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        if arr.is_empty() { break; }
+
+        let mut last_ts = after_ms;
+        for fill in &arr {
+            let ts: i64 = fill["createdAtTimestamp"].as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            if ts < start_ms || ts > end_ms { continue; }
+            if ts > last_ts { last_ts = ts; }
+
+            let symbol         = fill["symbol"].as_str().unwrap_or("");
+            let currency       = extract_base(symbol);
+            let base_currency  = currency.clone();
+            let quote_currency = symbol[currency.len()..].to_string();
+            let fee_cur        = fill["feeCurrency"].as_str().unwrap_or("").to_string();
+
+            logs.push(TransactionLog {
+                id:                 fill["fillId"].as_str().unwrap_or("").to_string(),
+                timestamp:          ts,
+                instrument_name:    symbol.to_string(),
+                transaction_type:   "trade".to_string(),
+                side:               match fill["side"].as_str().unwrap_or("BUY") {
+                                        "SELL" => "sell".to_string(),
+                                        _      => "buy".to_string(),
+                                    },
+                amount:             pf0(&fill["quantity"]),
+                price:              pf0(&fill["price"]),
+                fee:                pf0(&fill["fee"]),
+                fee_currency:       fee_cur,
+                currency,
+                profit_as_cashflow: 0.0,
+                balance:            0.0,
+                change:             0.0,
+                trade_id:           fill["fillId"].as_str().unwrap_or("").to_string(),
+                order_id:           fill["orderId"].as_str().unwrap_or("").to_string(),
+                info:               String::new(),
+                mark_price:         0.0,
+                index_price:        0.0,
+                equity:             0.0,
+                position:           pf0(&fill["quantity"]) * pf0(&fill["price"]),
+                base_currency,
+                quote_currency,
+            });
+        }
+
+        // Stop if we received fewer than a full page or didn't advance
+        if arr.len() < 200 || last_ts <= after_ms { break; }
+        after_ms = last_ts + 1; // advance past last seen fill
+    }
+
+    logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    Ok(logs)
 }
