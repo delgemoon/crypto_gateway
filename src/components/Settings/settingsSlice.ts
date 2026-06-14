@@ -50,6 +50,19 @@ export interface Account {
   rateTier: string;
 }
 
+// ── RFQ / Pricer Settings ─────────────────────────────────────────────────
+
+export interface RfqSettings {
+  /** Annual risk-free rate as decimal (e.g. 0.05 = 5%) */
+  riskFreeRate: number;
+  /** Fallback implied vol when market data unavailable (e.g. 0.80 = 80%) */
+  defaultVol: number;
+  /** Exchange to pull spot/index price from */
+  spotSource: 'deribit' | 'okx' | 'bybit' | 'coincall';
+  /** Exchange to pull mark IV from */
+  volSource: 'deribit' | 'okx' | 'bybit' | 'coincall';
+}
+
 // ── General Settings ───────────────────────────────────────────────────────
 
 export interface GeneralSettings {
@@ -103,6 +116,7 @@ interface SettingsState {
   accounts: Account[];
   activeAccountId: string | null;
   general: GeneralSettings;
+  rfq: RfqSettings;
   client: ClientInfo;
   telegram: TelegramSettings;
 }
@@ -123,6 +137,12 @@ const initialState: SettingsState = {
     botId: 1,
     bookEmitIntervalMs: 80,
     maxDashboardWidgets: 4,
+  },
+  rfq: {
+    riskFreeRate: 0.05,
+    defaultVol: 0.80,
+    spotSource: 'deribit',
+    volSource: 'deribit',
   },
   client: {
     companyName: '',
@@ -196,6 +216,10 @@ export const settingsSlice = createSlice({
     setGeneral(state, { payload }: PayloadAction<Partial<GeneralSettings>>) {
       state.general = { ...state.general, ...payload };
     },
+    // RFQ / pricer settings
+    setRfqSettings(state, { payload }: PayloadAction<Partial<RfqSettings>>) {
+      state.rfq = { ...state.rfq, ...payload };
+    },
     // Client info
     setClient(state, { payload }: PayloadAction<Partial<ClientInfo>>) {
       state.client = { ...state.client, ...payload };
@@ -211,7 +235,7 @@ export const {
   setTags, upsertTag, removeTag,
   setClients, upsertClient, removeClient,
   setAccounts, upsertAccount, removeAccount, setActiveAccount,
-  setGeneral, setClient, setTelegram,
+  setGeneral, setRfqSettings, setClient, setTelegram,
 } = settingsSlice.actions;
 
 export const selectTags     = (state: RootState) => state.settings.tags;
@@ -222,6 +246,7 @@ export const selectActiveAccountId = (state: RootState) => state.settings.active
 export const selectActiveAccount = (state: RootState) =>
   state.settings.accounts.find((a) => a.id === state.settings.activeAccountId) ?? null;
 export const selectGeneral = (state: RootState) => state.settings.general;
+export const selectRfqSettings = (state: RootState) => state.settings.rfq;
 export const selectClient = (state: RootState) => state.settings.client;
 export const selectTelegram = (state: RootState) => state.settings.telegram;
 

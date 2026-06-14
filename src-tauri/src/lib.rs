@@ -1,5 +1,6 @@
 mod api;
 mod agg_book;
+mod bs;
 mod db;
 mod market;
 mod order_id;
@@ -13,7 +14,7 @@ use api::dispatch;
 use api::models::{
     Account, AccountSummary, Broadcast, BroadcastPart, BroadcastSend, Client, ClientInfo, ClientTelegramChat,
     CreateBroadcastRequest, GeneralSettings, Instrument, Order, OrderResult,
-    PlaceOrderRequest, Position, ReferenceData, Tag, Ticker, TelegramSettings, TelegramChat, TelegramResult, Trade, TransactionLog,
+    PlaceOrderRequest, Position, ReferenceData, RfqSettings, Tag, Ticker, TelegramSettings, TelegramChat, TelegramResult, Trade, TransactionLog,
 };
 use rate_limiter::{RateLimiter, RateLimiterStatus};
 use ws::{WsManager, WsStatusSnapshot};
@@ -852,6 +853,140 @@ async fn coincall_get_rfq_quotes(
     api::coincall::get_rfq_quotes(&account, request_id.as_deref()).await
 }
 
+#[tauri::command]
+async fn coincall_accept_quote(
+    state: tauri::State<'_, AppState>,
+    account_id: String,
+    request_id: String,
+    quote_id: String,
+) -> Result<bool, String> {
+    let accounts = db::accounts::get_all(&state.pool, &state.enc_key)?;
+    let account = accounts.into_iter().find(|a| a.id == account_id)
+        .ok_or_else(|| "Account not found".to_string())?;
+    api::coincall::accept_quote(&request_id, &quote_id, &account).await
+}
+
+// ── RFQ Settings & Pricing ─────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_rfq_settings(state: tauri::State<'_, AppState>) -> Result<RfqSettings, String> {
+    db::rfq_settings::get_rfq(&state.pool)
+}
+
+#[tauri::command]
+fn save_rfq_settings(
+    state: tauri::State<'_, AppState>,
+    settings: RfqSettings,
+) -> Result<(), String> {
+    db::rfq_settings::save_rfq(&state.pool, &settings)
+}
+
+/// Fetch index price and/or mark IV for an underlying from the specified exchange.
+/// underlying: e.g. "BTC", "ETH"
+/// exchange: "deribit" | "okx" | "bybit" | "coincall"
+/// account_id: optional, used only for authenticated endpoints
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PricingMarketData {
+    pub index_price:     Option<f64>,
+    pub mark_iv:         Option<f64>,
+    pub instrument_used: String,
+    pub error:           Option<String>,
+}
+
+#[tauri::command]
+async fn fetch_pricing_market_data(
+    underlying: String,
+    exchange: String,
+    instrument_override: Option<String>,
+    testnet: Option<bool>,
+) -> Result<PricingMarketData, String> {
+    let tn = testnet.unwrap_or(false);
+    let coin = underlying.trim_end_matches("USD").trim_end_matches("USDT").to_ascii_uppercase();
+
+    // Determine which perpetual/spot instrument to hit for index price
+    let instrument_name = if let Some(ov) = instrument_override {
+        ov
+    } else {
+        match exchange.as_str() {
+            "deribit"  => format!("{}-PERPETUAL", coin),
+            "okx"      => format!("{}-USD-SWAP", coin),
+            "bybit"    => format!("{}USDT", coin),
+            "coincall" => format!("{}USD-PERP", coin),
+            other      => return Err(format!("Unknown exchange: {}", other)),
+        }
+    };
+
+    let result: Result<Ticker, String> = match exchange.as_str() {
+        "deribit"  => api::deribit::fetch_ticker(&instrument_name).await,
+        "okx"      => api::okx::fetch_ticker(&instrument_name).await,
+        "bybit"    => api::bybit::fetch_ticker(&instrument_name).await,
+        "coincall" => api::coincall::fetch_ticker(&instrument_name, tn).await,
+        other      => Err(format!("Unsupported exchange: {}", other)),
+    };
+
+    match result {
+        Ok(t) => Ok(PricingMarketData {
+            index_price:     t.index_price,
+            mark_iv:         t.mark_iv,
+            instrument_used: instrument_name,
+            error:           None,
+        }),
+        Err(e) => Ok(PricingMarketData {
+            index_price:     None,
+            mark_iv:         None,
+            instrument_used: instrument_name,
+            error:           Some(e),
+        }),
+    }
+}
+
+/// Fetch mark IV for a specific option instrument from the given exchange.
+/// Used to get vol_source market data per option leg.
+#[tauri::command]
+async fn fetch_option_market_data(
+    instrument_name: String,
+    exchange: String,
+    testnet: Option<bool>,
+) -> Result<PricingMarketData, String> {
+    let tn = testnet.unwrap_or(false);
+    let result: Result<Ticker, String> = match exchange.as_str() {
+        "deribit"  => api::deribit::fetch_ticker(&instrument_name).await,
+        "okx"      => api::okx::fetch_ticker(&instrument_name).await,
+        "bybit"    => api::bybit::fetch_ticker(&instrument_name).await,
+        "coincall" => api::coincall::fetch_ticker(&instrument_name, tn).await,
+        other      => Err(format!("Unsupported exchange: {}", other)),
+    };
+    match result {
+        Ok(t) => Ok(PricingMarketData {
+            index_price:     t.index_price,
+            mark_iv:         t.mark_iv,
+            instrument_used: instrument_name,
+            error:           None,
+        }),
+        Err(e) => Ok(PricingMarketData {
+            index_price:     None,
+            mark_iv:         None,
+            instrument_used: instrument_name,
+            error:           Some(e),
+        }),
+    }
+}
+
+/// Price multiple RFQ legs using Black-Scholes.
+#[tauri::command]
+fn price_rfq_legs(
+    legs: Vec<bs::LegPriceInput>,
+    spot_prices: std::collections::HashMap<String, f64>,
+    risk_free_rate: f64,
+    default_vol: f64,
+) -> Result<Vec<bs::LegPriceResult>, String> {
+    let results = legs.iter()
+        .map(|leg| bs::price_leg(leg, &spot_prices, risk_free_rate, default_vol))
+        .collect();
+    Ok(results)
+}
+
 // ── Aggregated Orderbook ───────────────────────────────────────────────────
 
 #[tauri::command]
@@ -1077,7 +1212,13 @@ pub fn run() {
             coincall_create_rfq,
             coincall_cancel_rfq,
             coincall_get_rfq_quotes,
+            coincall_accept_quote,
             coincall_get_rfq_list,
+            get_rfq_settings,
+            save_rfq_settings,
+            fetch_pricing_market_data,
+            fetch_option_market_data,
+            price_rfq_legs,
             get_coincall_ws_url,
             ws_connect,
             ws_disconnect,

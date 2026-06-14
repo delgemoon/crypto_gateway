@@ -3,6 +3,7 @@ pub mod agg_book_settings;
 pub mod broadcasts;
 pub mod clients;
 pub mod crypto;
+pub mod rfq_settings;
 pub mod settings;
 pub mod venue_settings;
 
@@ -156,6 +157,14 @@ CREATE TABLE IF NOT EXISTS agg_book_configs (
     tick_size        REAL,
     poll_interval_ms INTEGER NOT NULL DEFAULT 500,
     active           INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS rfq_settings (
+    id             INTEGER PRIMARY KEY CHECK(id = 1),
+    risk_free_rate REAL    NOT NULL DEFAULT 0.05,
+    default_vol    REAL    NOT NULL DEFAULT 0.80,
+    spot_source    TEXT    NOT NULL DEFAULT 'deribit',
+    vol_source     TEXT    NOT NULL DEFAULT 'deribit'
 );
 ";
 

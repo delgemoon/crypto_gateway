@@ -98,6 +98,42 @@ impl Default for GeneralSettings {
 
 // ── Client Info ─────────────────────────────────────────────────────────────
 
+// ── RFQ / Pricer Settings ────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RfqSettings {
+    /// Annual risk-free rate as decimal (e.g. 0.05 = 5%). Default 0.05.
+    #[serde(default = "rfq_default_rfr")]
+    pub risk_free_rate: f64,
+    /// Fallback implied vol when market data unavailable (e.g. 0.80 = 80%). Default 0.80.
+    #[serde(default = "rfq_default_vol")]
+    pub default_vol: f64,
+    /// Exchange to fetch spot/index price from: "deribit" | "okx" | "bybit" | "coincall".
+    #[serde(default = "rfq_default_source")]
+    pub spot_source: String,
+    /// Exchange to fetch mark IV from: "deribit" | "okx" | "bybit" | "coincall".
+    #[serde(default = "rfq_default_source")]
+    pub vol_source: String,
+}
+
+fn rfq_default_rfr()    -> f64    { 0.05 }
+fn rfq_default_vol()    -> f64    { 0.80 }
+fn rfq_default_source() -> String { "deribit".to_string() }
+
+impl Default for RfqSettings {
+    fn default() -> Self {
+        Self {
+            risk_free_rate: rfq_default_rfr(),
+            default_vol:    rfq_default_vol(),
+            spot_source:    rfq_default_source(),
+            vol_source:     rfq_default_source(),
+        }
+    }
+}
+
+// ── Client Info (legacy) ──────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientInfo {

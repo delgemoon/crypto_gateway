@@ -4,11 +4,11 @@ import { invoke } from '@tauri-apps/api/core';
 import { useAppDispatch, useAppSelector } from '../../hooks';
 import {
   selectAccounts, selectGeneral, selectTelegram,
-  selectTags, selectClients,
-  setAccounts, upsertAccount, removeAccount, setGeneral, setTelegram,
+  selectTags, selectClients, selectRfqSettings,
+  setAccounts, upsertAccount, removeAccount, setGeneral, setRfqSettings, setTelegram,
   setTags, upsertTag, removeTag as removeTagAction,
   setClients, upsertClient, removeClient as removeClientAction,
-  Account, GeneralSettings, TelegramSettings,
+  Account, GeneralSettings, TelegramSettings, RfqSettings,
   Tag as TagModel, Client, ClientTelegramChat,
 } from './settingsSlice';
 import {
@@ -27,7 +27,7 @@ import {
 
 // ── Types & constants ──────────────────────────────────────────────────────
 
-type SettingsTab = 'general' | 'exchange' | 'client' | 'telegram' | 'tags' | 'venue' | 'aggbook';
+type SettingsTab = 'general' | 'exchange' | 'client' | 'telegram' | 'tags' | 'venue' | 'aggbook' | 'rfq';
 const EXCHANGES = ['deribit', 'okx', 'bybit', 'coincall', 'binance', 'mexc', 'hyperliquid', 'uniswap', 'bullish'] as const;
 const TIF_OPTIONS = [
   { value: 'good_til_cancelled', label: 'GTC — Good Till Cancelled' },
@@ -1634,6 +1634,124 @@ const AggBookTab: FunctionComponent = () => {
   );
 };
 
+// ── RFQ Settings Tab ───────────────────────────────────────────────────────
+
+const PRICER_EXCHANGES = [
+  { value: 'deribit',  label: 'Deribit' },
+  { value: 'okx',      label: 'OKX' },
+  { value: 'bybit',    label: 'Bybit' },
+  { value: 'coincall', label: 'CoInCall' },
+] as const;
+
+const RfqSettingsTab: FunctionComponent = () => {
+  const dispatch = useAppDispatch();
+  const rfq      = useAppSelector(selectRfqSettings);
+  const [saved, setSaved]   = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    invoke<RfqSettings>('get_rfq_settings')
+      .then(s => dispatch(setRfqSettings(s)))
+      .catch(console.error);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const upd = (patch: Partial<RfqSettings>) => dispatch(setRfqSettings(patch));
+
+  const handleSave = async () => {
+    setSaving(true);
+    try {
+      await invoke('save_rfq_settings', { settings: rfq });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e) { console.error(e); }
+    finally { setSaving(false); }
+  };
+
+  return (
+    <>
+      <SectionCard>
+        <SectionHeader><h3>Black-Scholes Defaults</h3></SectionHeader>
+        <SectionBody>
+          <p style={{ fontSize: '0.8rem', color: '#7e8b99', marginBottom: '0.75rem' }}>
+            These values are used in the RFQ Pricer panel. You can override them per-session in the panel.
+          </p>
+          <FormGrid>
+            <FormGroup>
+              <Label>Risk-Free Rate (%)</Label>
+              <Input
+                type="number" step="0.01" min="0" max="50"
+                value={(rfq.riskFreeRate * 100).toFixed(2)}
+                onChange={e => upd({ riskFreeRate: Math.max(0, parseFloat(e.target.value) || 0) / 100 })}
+              />
+              <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
+                Annual rate (e.g. 5 = 5% p.a.)
+              </p>
+            </FormGroup>
+            <FormGroup>
+              <Label>Default Implied Vol (%)</Label>
+              <Input
+                type="number" step="1" min="1" max="2000"
+                value={(rfq.defaultVol * 100).toFixed(0)}
+                onChange={e => upd({ defaultVol: Math.max(0.001, parseFloat(e.target.value) || 80) / 100 })}
+              />
+              <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
+                Fallback when market IV is unavailable (e.g. 80 = 80%)
+              </p>
+            </FormGroup>
+          </FormGrid>
+        </SectionBody>
+      </SectionCard>
+
+      <SectionCard>
+        <SectionHeader><h3>Market Data Sources</h3></SectionHeader>
+        <SectionBody>
+          <p style={{ fontSize: '0.8rem', color: '#7e8b99', marginBottom: '0.75rem' }}>
+            Select which exchange to use when auto-fetching spot/index prices and implied volatility in the RFQ Pricer.
+            These use public (unauthenticated) endpoints.
+          </p>
+          <FormGrid>
+            <FormGroup>
+              <Label>Spot / Index Price Source</Label>
+              <Select
+                value={rfq.spotSource}
+                onChange={e => upd({ spotSource: e.target.value as RfqSettings['spotSource'] })}
+              >
+                {PRICER_EXCHANGES.map(ex => (
+                  <option key={ex.value} value={ex.value}>{ex.label}</option>
+                ))}
+              </Select>
+              <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
+                Deribit: BTC-PERPETUAL · OKX: BTC-USD-SWAP · Bybit: BTCUSDT · CoInCall: BTCUSD-PERP
+              </p>
+            </FormGroup>
+            <FormGroup>
+              <Label>Implied Vol Source</Label>
+              <Select
+                value={rfq.volSource}
+                onChange={e => upd({ volSource: e.target.value as RfqSettings['volSource'] })}
+              >
+                {PRICER_EXCHANGES.map(ex => (
+                  <option key={ex.value} value={ex.value}>{ex.label}</option>
+                ))}
+              </Select>
+              <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
+                Fetches mark IV from the same option instrument on the selected exchange.
+              </p>
+            </FormGroup>
+          </FormGrid>
+        </SectionBody>
+      </SectionCard>
+
+      <ButtonRow>
+        <Btn $variant="primary" onClick={handleSave} disabled={saving}>
+          {saving ? 'Saving…' : 'Save RFQ Settings'}
+        </Btn>
+      </ButtonRow>
+      <SaveBanner $visible={saved}>✓ Saved</SaveBanner>
+    </>
+  );
+};
+
 // ── Root Settings component ────────────────────────────────────────────────
 const Settings: FunctionComponent = () => {
   const [tab, setTab] = useState<SettingsTab>('exchange');
@@ -1648,6 +1766,7 @@ const Settings: FunctionComponent = () => {
         <TabBtn $active={tab === 'tags'} onClick={() => setTab('tags')}>🏷 Tags</TabBtn>
         <TabBtn $active={tab === 'telegram'} onClick={() => setTab('telegram')}>🤖 Telegram</TabBtn>
         <TabBtn $active={tab === 'aggbook'} onClick={() => setTab('aggbook')}>📚 Agg Book</TabBtn>
+        <TabBtn $active={tab === 'rfq'} onClick={() => setTab('rfq')}>📊 RFQ Pricer</TabBtn>
       </TabBar>
       <TabContent>
         {tab === 'general'  && <GeneralTab />}
@@ -1657,6 +1776,7 @@ const Settings: FunctionComponent = () => {
         {tab === 'tags'     && <TagsTab />}
         {tab === 'telegram' && <TelegramTab />}
         {tab === 'aggbook'  && <AggBookTab />}
+        {tab === 'rfq'      && <RfqSettingsTab />}
       </TabContent>
     </SettingsContainer>
   );

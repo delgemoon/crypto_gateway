@@ -856,6 +856,23 @@ pub async fn get_rfq_quotes(account: &Account, request_id: Option<&str>) -> Resu
     Ok(resp["data"].clone())
 }
 
+/// Accept a specific quote for an RFQ.
+pub async fn accept_quote(request_id: &str, quote_id: &str, account: &Account) -> Result<bool, String> {
+    let base_url = base(account.testnet);
+    let uri = "/open/option/blocktrade/request/accept/v1";
+    let body = json!({ "requestId": request_id, "quoteId": quote_id });
+    let headers = auth_post(&account.api_key, &account.api_secret, uri, &body);
+
+    let resp: Value = Client::new()
+        .post(&format!("{}{}", base_url, uri))
+        .headers(headers)
+        .json(&body)
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+
+    Ok(resp["code"].as_i64() == Some(0))
+}
+
 pub async fn fetch_orderbook(instrument_name: &str, depth: u32, testnet: bool) -> Result<OrderbookSnapshot, String> {
     let client = Client::new();
     let url = format!(
