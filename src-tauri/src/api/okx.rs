@@ -129,6 +129,7 @@ pub async fn fetch_ticker(instrument_name: &str) -> Result<Ticker, String> {
         last_price:       last,
         mark_price:       last,
         index_price:      None,
+        underlying_price: None,
         open_interest:    str_to_f64(&d["openInterest"]),
         stats: TickerStats {
             high:         str_to_f64(&d["high24h"]),
@@ -139,6 +140,69 @@ pub async fn fetch_ticker(instrument_name: &str) -> Result<Ticker, String> {
         },
         mark_iv: None, bid_iv: None, ask_iv: None,
         delta: None, gamma: None, vega: None, theta: None,
+    })
+}
+
+/// Fetch full option market data (markIv, greeks, index price) from OKX.
+/// Uses /public/opt-summary which contains all option analytics per instrument.
+pub async fn fetch_option_ticker(instrument_name: &str) -> Result<Ticker, String> {
+    // opt-summary requires uly (underlying) e.g. "BTC-USD"
+    // instrument_name e.g. "BTC-USD-250627-64000-C"
+    let parts: Vec<&str> = instrument_name.split('-').collect();
+    let uly = if parts.len() >= 2 {
+        format!("{}-{}", parts[0], parts[1])
+    } else {
+        return Err(format!("Cannot derive underlying from {}", instrument_name));
+    };
+
+    let url = format!(
+        "{}/api/v5/public/opt-summary?uly={}&instId={}",
+        OKX_BASE, uly, instrument_name
+    );
+
+    let resp: Value = Client::new()
+        .get(&url)
+        .header(CONTENT_TYPE, "application/json")
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+
+    if resp["code"].as_str() != Some("0") {
+        return Err(resp["msg"].as_str().unwrap_or("OKX opt-summary error").to_string());
+    }
+
+    // opt-summary returns a list; find our instrument
+    let data = resp["data"].as_array()
+        .and_then(|arr| arr.iter().find(|d| d["instId"].as_str() == Some(instrument_name)))
+        .cloned()
+        .unwrap_or_default();
+
+    // Also fetch bid/ask from market/ticker
+    let ticker = fetch_ticker(instrument_name).await.ok();
+
+    Ok(Ticker {
+        instrument_name: instrument_name.to_string(),
+        best_bid_price:  ticker.as_ref().and_then(|t| t.best_bid_price),
+        best_ask_price:  ticker.as_ref().and_then(|t| t.best_ask_price),
+        best_bid_amount: ticker.as_ref().and_then(|t| t.best_bid_amount),
+        best_ask_amount: ticker.as_ref().and_then(|t| t.best_ask_amount),
+        last_price:      ticker.as_ref().and_then(|t| t.last_price),
+        // markPx in opt-summary
+        mark_price:      str_to_f64(&data["markPx"]),
+        // OKX opt-summary: fwdPx = forward/underlying price, idxPx would be spot index
+        index_price:     str_to_f64(&data["idxPx"]),
+        underlying_price: str_to_f64(&data["fwdPx"]),
+        open_interest:   str_to_f64(&data["oi"]),
+        stats: TickerStats {
+            high: None, low: None, price_change: None, volume: None, volume_usd: None,
+        },
+        // markVol in opt-summary is in % (e.g. 56.3 = 56.3%)
+        mark_iv:  str_to_f64(&data["markVol"]),
+        bid_iv:   str_to_f64(&data["bidVol"]),
+        ask_iv:   str_to_f64(&data["askVol"]),
+        delta:    str_to_f64(&data["delta"]),
+        gamma:    str_to_f64(&data["gamma"]),
+        vega:     str_to_f64(&data["vega"]),
+        theta:    str_to_f64(&data["theta"]),
     })
 }
 

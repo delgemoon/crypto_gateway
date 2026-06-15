@@ -272,43 +272,63 @@ async fn fetch_future_instruments(currency: &str, testnet: bool) -> Result<Vec<I
     Ok(instruments)
 }
 
-// ── Ticker (public for price; orderbook for bid/ask) ───────────────────────
+// ── Index price (public) ───────────────────────────────────────────────────
 
+/// Fetch the index price for a coin from CoInCall's public index endpoint.
+/// coin: "BTC" | "ETH" etc.
+pub async fn fetch_index_price(coin: &str, testnet: bool) -> Result<f64, String> {
+    // CoInCall index endpoint: /open/public/index/v1?currency=BTC
+    let url = format!("{}/open/public/index/v1?currency={}", base(testnet), coin.to_uppercase());
+    let resp: Value = Client::new()
+        .get(&url)
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+
+    eprintln!("[coincall] fetch_index_price {} resp: {}", coin, serde_json::to_string(&resp).unwrap_or_default());
+
+    if resp["code"].as_i64() == Some(0) {
+        if let Some(price) = resp["data"]["indexPrice"].as_f64()
+            .or_else(|| resp["data"]["price"].as_f64())
+            .or_else(|| resp["data"].as_f64())
+        {
+            return Ok(price);
+        }
+    }
+    Err(resp["msg"].as_str().unwrap_or("CoInCall index price error").to_string())
+}
+
+// ── Ticker (public) ────────────────────────────────────────────────────────
+
+/// Fetch option detail from GET /open/option/detail/v1/{symbol}.
+/// Returns mark price, IV, greeks, and underlying index price.
 pub async fn fetch_ticker(instrument_name: &str, testnet: bool) -> Result<Ticker, String> {
-    let detail_url = format!("{}/open/option/detail/v1/{}", base(testnet), instrument_name);
-    let ob_url     = format!("{}/open/option/order/orderbook/v1/{}", base(testnet), instrument_name);
+    let url = format!("{}/open/option/detail/v1/{}", base(testnet), instrument_name);
 
-    // Run both requests concurrently
-    let (detail_resp, ob_resp): (Value, Value) = tokio::try_join!(
-        async { Client::new().get(&detail_url).header(CONTENT_TYPE, "application/json")
-            .send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string()) },
-        async { Client::new().get(&ob_url).header(CONTENT_TYPE, "application/json")
-            .send().await.map_err(|e| e.to_string())?.json().await.map_err(|e| e.to_string()) },
-    )?;
+    let resp: Value = Client::new()
+        .get(&url)
+        .header(CONTENT_TYPE, "application/json")
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
 
-    if detail_resp["code"].as_i64() != Some(0) {
-        return Err(detail_resp["msg"].as_str().unwrap_or("CoInCall ticker error").to_string());
+    eprintln!("[coincall] fetch_ticker {} resp: {}", instrument_name,
+        serde_json::to_string(&resp).unwrap_or_default());
+
+    if resp["code"].as_i64() != Some(0) {
+        return Err(resp["msg"].as_str().unwrap_or("CoInCall ticker error").to_string());
     }
 
-    let d  = &detail_resp["data"];
-    let ob = &ob_resp["data"];
-
-    let parse_ob_price = |arr: &Value| -> Option<f64> {
-        arr.as_array()?.first()?.get("price")?.as_str()?.parse().ok()
-    };
-    let parse_ob_size = |arr: &Value| -> Option<f64> {
-        arr.as_array()?.first()?.get("size")?.as_str()?.parse().ok()
-    };
+    let d = &resp["data"];
 
     Ok(Ticker {
         instrument_name:  instrument_name.to_string(),
-        best_bid_price:   parse_ob_price(&ob["bids"]),
-        best_ask_price:   parse_ob_price(&ob["asks"]),
-        best_bid_amount:  parse_ob_size(&ob["bids"]),
-        best_ask_amount:  parse_ob_size(&ob["asks"]),
+        best_bid_price:   d["bidPrice"].as_f64(),
+        best_ask_price:   d["askPrice"].as_f64(),
+        best_bid_amount:  d["bidSize"].as_f64(),
+        best_ask_amount:  d["askSize"].as_f64(),
         last_price:       d["lastPrice"].as_f64(),
         mark_price:       d["markPrice"].as_f64(),
-        index_price:      d["underlyingPrice"].as_f64().or_else(|| d["indexPrice"].as_f64()),
+        index_price:      d["indexPrice"].as_f64(),
+        underlying_price: d["underlyingPrice"].as_f64(),
         open_interest:    d["openInterest"].as_f64(),
         stats: TickerStats {
             high:         d["price24hHigh"].as_f64(),
@@ -318,8 +338,8 @@ pub async fn fetch_ticker(instrument_name: &str, testnet: bool) -> Result<Ticker
             volume_usd:   d["volumeUsd24h"].as_f64(),
         },
         mark_iv:  d["iv"].as_f64(),
-        bid_iv:   None,
-        ask_iv:   None,
+        bid_iv:   d["bidIv"].as_f64(),
+        ask_iv:   d["askIv"].as_f64(),
         delta:    d["delta"].as_f64(),
         gamma:    d["gamma"].as_f64(),
         vega:     d["vega"].as_f64(),
@@ -640,6 +660,37 @@ fn parse_summary_top(d: &Value) -> (f64, f64, f64, f64, f64) {
     (p("equity"), p("availableMargin"), p("imAmount"), p("mmAmount"), p("unrealizedPnL"))
 }
 
+/// Fetch per-coin wallet balances from /open/account/summary/v1.
+/// Returns `(coin_balance, usdt_balance)` where coin_balance is the equity of the first
+/// non-USDT coin found, and usdt_balance is the USDT equity.
+pub async fn get_full_balances(account: &Account) -> Result<(f64, f64), String> {
+    let base_url = base(account.testnet);
+    let uri = "/open/account/summary/v1";
+    let (headers, _) = auth_get(&account.api_key, &account.api_secret, uri, &[]);
+    let resp: Value = Client::new()
+        .get(&format!("{}{}", base_url, uri))
+        .headers(headers).send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    if resp["code"].as_i64() != Some(0) {
+        return Err(resp["msg"].as_str().unwrap_or("balance error").to_string());
+    }
+    let parse = |v: &Value| v.as_str().and_then(|s| s.parse::<f64>().ok()).or_else(|| v.as_f64()).unwrap_or(0.0);
+    let mut coin_balance = 0.0_f64;
+    let mut usdt_balance = 0.0_f64;
+    if let Some(accs) = resp["data"]["accounts"].as_array() {
+        for a in accs {
+            let coin = a["coin"].as_str().unwrap_or("").to_ascii_uppercase();
+            let equity = parse(&a["equityAmount"]);
+            if coin == "USDT" || coin == "USD" {
+                usdt_balance += equity;
+            } else if equity.abs() > 0.0 {
+                coin_balance += equity;  // accumulate all non-stable coin balances
+            }
+        }
+    }
+    Ok((coin_balance, usdt_balance))
+}
+
 /// Get open positions (options + futures).
 pub async fn get_positions(_currency: &str, account: &Account) -> Result<Vec<Position>, String> {
     let base_url = base(account.testnet);
@@ -807,34 +858,21 @@ pub async fn cancel_rfq(request_id: &str, account: &Account) -> Result<bool, Str
 }
 
 /// Get list of user's RFQs.
-pub async fn get_rfq_list(account: &Account) -> Result<Value, String> {
+/// `role`: "MAKER" to see incoming seeks from takers, "TAKER" to see your own seeks, None for all.
+pub async fn get_rfq_list(account: &Account, role: Option<&str>, rfq_state: Option<&str>) -> Result<Value, String> {
     let base_url = base(account.testnet);
     let uri = "/open/option/blocktrade/rfqList/v1";
-    let (headers, _) = auth_get(&account.api_key, &account.api_secret, uri, &[]);
 
-    let resp: Value = Client::new()
-        .get(&format!("{}{}", base_url, uri))
-        .headers(headers)
-        .send().await.map_err(|e| e.to_string())?
-        .json().await.map_err(|e| e.to_string())?;
-
-    if resp["code"].as_i64() != Some(0) {
-        return Err(resp["msg"].as_str().unwrap_or("RFQ list error").to_string());
+    let mut params: Vec<(&str, String)> = vec![];
+    if let Some(r) = role {
+        params.push(("role", r.to_string()));
     }
-
-    Ok(resp["data"]["rfqList"].clone())
-}
-
-/// Get quotes received for a specific RFQ (or all if request_id is empty).
-pub async fn get_rfq_quotes(account: &Account, request_id: Option<&str>) -> Result<Value, String> {
-    let base_url = base(account.testnet);
-    let uri = "/open/option/blocktrade/request/getQuotesReceived/v1";
-
-    let params: Vec<(&str, String)> = if let Some(rid) = request_id.filter(|s| !s.is_empty()) {
-        vec![("requestId", rid.to_string())]
-    } else {
-        vec![]
-    };
+    // Allow explicit state override; default MAKER→OPEN, history→CLOSE
+    if let Some(s) = rfq_state {
+        params.push(("state", s.to_string()));
+    } else if role == Some("MAKER") {
+        params.push(("state", "OPEN".to_string()));
+    }
 
     let (headers, query) = auth_get(&account.api_key, &account.api_secret, uri, &params);
     let url = if query.is_empty() {
@@ -849,11 +887,136 @@ pub async fn get_rfq_quotes(account: &Account, request_id: Option<&str>) -> Resu
         .send().await.map_err(|e| e.to_string())?
         .json().await.map_err(|e| e.to_string())?;
 
+    eprintln!("[coincall] get_rfq_list({:?}) resp: {}", role, serde_json::to_string(&resp).unwrap_or_default());
+
+    if resp["code"].as_i64() != Some(0) {
+        return Err(resp["msg"].as_str().unwrap_or("RFQ list error").to_string());
+    }
+
+    // Normalise legs: API returns `quantity` in list but `qty` in create response.
+    // Map everything to `qty` so the frontend type is consistent.
+    let rfq_list = resp["data"]["rfqList"].clone();
+    if let Some(arr) = rfq_list.as_array() {
+        let normalised: Vec<Value> = arr.iter().map(|rfq| {
+            let mut r = rfq.clone();
+            if let Some(legs) = r["legs"].as_array() {
+                let fixed: Vec<Value> = legs.iter().map(|leg| {
+                    let mut l = leg.clone();
+                    // If `qty` missing but `quantity` present, copy it over
+                    if l["qty"].is_null() || !l["qty"].is_string() {
+                        if let Some(q) = l["quantity"].as_str() {
+                            l["qty"] = Value::String(q.to_string());
+                        }
+                    }
+                    l
+                }).collect();
+                r["legs"] = Value::Array(fixed);
+            }
+            r
+        }).collect();
+        return Ok(Value::Array(normalised));
+    }
+
+    Ok(rfq_list)
+}
+
+/// Create a quote (maker submits prices for an incoming RFQ seek).
+pub async fn create_quote(
+    request_id: &str,
+    quote_side: Option<&str>,
+    legs: &[Value],
+    account: &Account,
+) -> Result<Value, String> {
+    let base_url = base(account.testnet);
+    let uri = "/open/option/blocktrade/quote/create/v1";
+
+    let mut body = json!({
+        "requestId": request_id.parse::<i64>().unwrap_or(0),
+        "legs": legs,
+    });
+    if let Some(qs) = quote_side {
+        body["quoteSide"] = Value::String(qs.to_string());
+    }
+
+    let headers = auth_post(&account.api_key, &account.api_secret, uri, &body);
+
+    let resp: Value = Client::new()
+        .post(&format!("{}{}", base_url, uri))
+        .headers(headers)
+        .json(&body)
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+
+    eprintln!("[coincall] create_quote resp: {}", serde_json::to_string(&resp).unwrap_or_default());
+
+    if resp["code"].as_i64() != Some(0) {
+        return Err(resp["msg"].as_str().unwrap_or("Create quote error").to_string());
+    }
+
+    Ok(resp["data"].clone())
+}
+
+/// Cancel a maker quote by quoteId.
+pub async fn cancel_quote(quote_id: &str, account: &Account) -> Result<(), String> {
+    let base_url = base(account.testnet);
+    let uri = "/open/option/blocktrade/quote/cancel/v1";
+    let body = json!({
+        "quoteId": quote_id.parse::<i64>().unwrap_or(0),
+    });
+    let headers = auth_post(&account.api_key, &account.api_secret, uri, &body);
+    let resp: Value = Client::new()
+        .post(&format!("{}{}", base_url, uri))
+        .headers(headers)
+        .json(&body)
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    eprintln!("[coincall] cancel_quote resp: {}", serde_json::to_string(&resp).unwrap_or_default());
+    if resp["code"].as_i64() != Some(0) {
+        return Err(resp["msg"].as_str().unwrap_or("Cancel quote error").to_string());
+    }
+    Ok(())
+}
+
+/// Get quotes for a specific RFQ seek.
+pub async fn get_rfq_quotes(account: &Account, request_id: Option<&str>) -> Result<Value, String> {
+    let base_url = base(account.testnet);
+    // list-quote/v1 is the documented endpoint for a maker to see quotes on a seek
+    let uri = "/open/option/blocktrade/list-quote/v1";
+
+    let mut params: Vec<(&str, String)> = vec![];
+    if let Some(rid) = request_id.filter(|s| !s.is_empty()) {
+        params.push(("requestId", rid.to_string()));
+    }
+    // state=OPEN limits to live quotes only
+    params.push(("state", "OPEN".to_string()));
+
+    let (headers, query) = auth_get(&account.api_key, &account.api_secret, uri, &params);
+    let url = format!("{}{}?{}", base_url, uri, query);
+
+    eprintln!("[coincall] get_rfq_quotes GET {}", url);
+
+    let resp: Value = Client::new()
+        .get(&url)
+        .headers(headers)
+        .send().await.map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+
+    eprintln!("[coincall] get_rfq_quotes resp: {}", serde_json::to_string(&resp).unwrap_or_default());
+
     if resp["code"].as_i64() != Some(0) {
         return Err(resp["msg"].as_str().unwrap_or("RFQ quotes error").to_string());
     }
 
-    Ok(resp["data"].clone())
+    let data = &resp["data"];
+    if data.is_array() {
+        Ok(data.clone())
+    } else if data["quoteList"].is_array() {
+        Ok(data["quoteList"].clone())
+    } else if data["list"].is_array() {
+        Ok(data["list"].clone())
+    } else {
+        Ok(data.clone())
+    }
 }
 
 /// Accept a specific quote for an RFQ.

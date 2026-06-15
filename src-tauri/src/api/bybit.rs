@@ -238,6 +238,7 @@ pub async fn fetch_ticker(instrument_name: &str) -> Result<Ticker, String> {
         last_price:       sf64(&d["lastPrice"]),
         mark_price:       sf64(&d["markPrice"]),
         index_price:      sf64(&d["indexPrice"]),
+        underlying_price: sf64(&d["underlyingPrice"]),
         open_interest:    sf64(&d["openInterest"]),
         stats: TickerStats {
             high:         sf64(&d["highPrice24h"]),
@@ -772,6 +773,13 @@ pub async fn get_transaction_log(
         chunk_start = chunk_end + 1;
     }
 
+    // ── Fetch deposits and withdrawals from asset endpoints ──────────────────
+    // These are NOT in /v5/account/transaction-log — they need separate calls.
+    let deposit_logs = fetch_deposit_withdrawal_logs(account, start_ms, end_ms, "deposit").await;
+    let withdraw_logs = fetch_deposit_withdrawal_logs(account, start_ms, end_ms, "withdrawal").await;
+    all_logs.extend(deposit_logs);
+    all_logs.extend(withdraw_logs);
+
     all_logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
     // ── Enrich with mark/index price from execution list ─────────────────────
@@ -862,4 +870,105 @@ async fn fetch_execution_prices(
         }
     }
     map
+}
+
+/// Fetch deposit or withdrawal records from Bybit asset endpoints.
+/// `kind` must be either `"deposit"` or `"withdrawal"`.
+async fn fetch_deposit_withdrawal_logs(
+    account: &Account,
+    start_ms: i64,
+    end_ms:   i64,
+    kind:     &str,
+) -> Vec<TransactionLog> {
+    let client = Client::new();
+    let mut logs: Vec<TransactionLog> = Vec::new();
+    let is_deposit = kind == "deposit";
+    let tx_type    = if is_deposit { "deposit" } else { "withdrawal" };
+    let path       = if is_deposit { "/v5/asset/deposit/query-record" } else { "/v5/asset/withdraw/query-record" };
+    let mut cursor = String::new();
+
+    // Deposit status codes: 0=unknown,1=ToBeConfirmed,2=Processing,3=Success,4=Failed
+    let deposit_status_label = |v: &Value| -> String {
+        match v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())) {
+            Some(0) => "Unknown".into(), Some(1) => "Pending".into(),
+            Some(2) => "Processing".into(), Some(3) => "Success".into(),
+            Some(4) => "Failed".into(),
+            _ => v.as_str().unwrap_or("").to_string(),
+        }
+    };
+
+    loop {
+        let qs = if cursor.is_empty() {
+            format!("startTime={}&endTime={}&limit=50", start_ms, end_ms)
+        } else {
+            format!("startTime={}&endTime={}&limit=50&cursor={}", start_ms, end_ms, cursor)
+        };
+        let url = format!("{}{path}?{qs}", base(account.testnet));
+        let headers = auth_get(&account.api_key, &account.api_secret, &qs);
+        let resp: Value = match client.get(&url).headers(headers).send().await {
+            Ok(r) => r.json().await.unwrap_or(Value::Null),
+            Err(_) => break,
+        };
+        if resp["retCode"].as_i64() != Some(0) {
+            eprintln!("[bybit] {} query error: {:?}", kind, resp["retMsg"]);
+            break;
+        }
+        let rows = match resp["result"]["rows"].as_array() {
+            Some(r) => r.clone(),
+            None => break,
+        };
+        for row in &rows {
+            let coin: String = row["coin"].as_str().unwrap_or("").to_string();
+            let amount: f64  = row["amount"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+            let fee: f64     = if is_deposit {
+                row["depositFee"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0)
+            } else {
+                row["withdrawFee"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0)
+            };
+            let change = if is_deposit { amount } else { -(amount + fee) };
+            // Deposit uses successAt (ms string); withdrawal uses createTime
+            let ts_field = if is_deposit { "successAt" } else { "createTime" };
+            let ts: i64  = row[ts_field].as_str()
+                .and_then(|s| s.parse().ok()).unwrap_or(0);
+            let id = if is_deposit {
+                row["txID"].as_str().unwrap_or("").to_string()
+            } else {
+                row["withdrawId"].as_str().unwrap_or("").to_string()
+            };
+            let status = if is_deposit {
+                deposit_status_label(&row["status"])
+            } else {
+                row["status"].as_str().unwrap_or("").to_string()
+            };
+
+            logs.push(TransactionLog {
+                id,
+                timestamp:          ts,
+                instrument_name:    String::new(),
+                transaction_type:   tx_type.to_string(),
+                side:               String::new(),
+                amount,
+                price:              0.0,
+                fee,
+                fee_currency:       coin.clone(),
+                currency:           coin.clone(),
+                profit_as_cashflow: change,
+                balance:            0.0,
+                change,
+                trade_id:           String::new(),
+                order_id:           String::new(),
+                info:               status,
+                mark_price:         0.0,
+                index_price:        0.0,
+                equity:             0.0,
+                position:           0.0,
+                base_currency:      coin.clone(),
+                quote_currency:     coin.clone(),
+            });
+        }
+        let next = resp["result"]["nextPageCursor"].as_str().unwrap_or("").to_string();
+        if next.is_empty() || rows.is_empty() { break; }
+        cursor = next;
+    }
+    logs
 }

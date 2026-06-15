@@ -170,6 +170,7 @@ pub async fn fetch_ticker(instrument_name: &str) -> Result<Ticker, String> {
         last_price:       mark,
         mark_price:       mark,
         index_price:      mark,
+        underlying_price: None,
         open_interest:    None,
         stats:            TickerStats { high: None, low: None, price_change: None, volume: None, volume_usd: None },
         mark_iv: None, bid_iv: None, ask_iv: None,

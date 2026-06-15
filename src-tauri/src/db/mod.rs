@@ -160,11 +160,16 @@ CREATE TABLE IF NOT EXISTS agg_book_configs (
 );
 
 CREATE TABLE IF NOT EXISTS rfq_settings (
-    id             INTEGER PRIMARY KEY CHECK(id = 1),
-    risk_free_rate REAL    NOT NULL DEFAULT 0.05,
-    default_vol    REAL    NOT NULL DEFAULT 0.80,
-    spot_source    TEXT    NOT NULL DEFAULT 'deribit',
-    vol_source     TEXT    NOT NULL DEFAULT 'deribit'
+    id                INTEGER PRIMARY KEY CHECK(id = 1),
+    risk_free_rate    REAL    NOT NULL DEFAULT 0.05,
+    default_vol       REAL    NOT NULL DEFAULT 0.80,
+    spot_source       TEXT    NOT NULL DEFAULT 'deribit',
+    vol_source        TEXT    NOT NULL DEFAULT 'deribit',
+    base_spread       REAL    NOT NULL DEFAULT 0.01,
+    gamma_sensitivity REAL    NOT NULL DEFAULT 0.5,
+    vega_sensitivity  REAL    NOT NULL DEFAULT 0.0005,
+    max_skew          REAL    NOT NULL DEFAULT 0.05,
+    trading_coin      TEXT    NOT NULL DEFAULT 'BTC'
 );
 ";
 
@@ -203,6 +208,14 @@ pub fn init_db(db_path: &Path) -> Result<DbPool, String> {
     let _ = conn.execute("ALTER TABLE accounts ADD COLUMN rpc_url TEXT", []);
     let _ = conn.execute("ALTER TABLE accounts ADD COLUMN chain_id INTEGER", []);
     // telegram_known_chats is created by MIGRATIONS above if missing; no ALTER needed
+    // Greek spread settings columns (idempotent for existing DBs)
+    let _ = conn.execute("ALTER TABLE rfq_settings ADD COLUMN base_spread REAL NOT NULL DEFAULT 0.01", []);
+    let _ = conn.execute("ALTER TABLE rfq_settings ADD COLUMN gamma_sensitivity REAL NOT NULL DEFAULT 0.5", []);
+    let _ = conn.execute("ALTER TABLE rfq_settings ADD COLUMN vega_sensitivity REAL NOT NULL DEFAULT 0.0005", []);
+    let _ = conn.execute("ALTER TABLE rfq_settings ADD COLUMN max_skew REAL NOT NULL DEFAULT 0.05", []);
+    let _ = conn.execute("ALTER TABLE rfq_settings ADD COLUMN trading_coin TEXT NOT NULL DEFAULT 'BTC'", []);
+    let _ = conn.execute("ALTER TABLE rfq_settings ADD COLUMN auto_quote INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute("ALTER TABLE rfq_settings ADD COLUMN auto_quote_timeout_secs INTEGER NOT NULL DEFAULT 30", []);
 
     Ok(pool)
 }

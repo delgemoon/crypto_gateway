@@ -1673,7 +1673,7 @@ const RfqSettingsTab: FunctionComponent = () => {
         <SectionHeader><h3>Black-Scholes Defaults</h3></SectionHeader>
         <SectionBody>
           <p style={{ fontSize: '0.8rem', color: '#7e8b99', marginBottom: '0.75rem' }}>
-            These values are used in the RFQ Pricer panel. You can override them per-session in the panel.
+            These values are used in the RFQ Pricer panel.
           </p>
           <FormGrid>
             <FormGroup>
@@ -1707,35 +1707,128 @@ const RfqSettingsTab: FunctionComponent = () => {
         <SectionBody>
           <p style={{ fontSize: '0.8rem', color: '#7e8b99', marginBottom: '0.75rem' }}>
             Select which exchange to use when auto-fetching spot/index prices and implied volatility in the RFQ Pricer.
-            These use public (unauthenticated) endpoints.
+            Both spot price and mark IV are pulled from the same exchange's ticker. These use public (unauthenticated) endpoints.
           </p>
           <FormGrid>
             <FormGroup>
-              <Label>Spot / Index Price Source</Label>
+              <Label>Pricer Exchange</Label>
               <Select
-                value={rfq.spotSource}
-                onChange={e => upd({ spotSource: e.target.value as RfqSettings['spotSource'] })}
+                value={rfq.pricerExchange}
+                onChange={e => upd({ pricerExchange: e.target.value as RfqSettings['pricerExchange'] })}
               >
                 {PRICER_EXCHANGES.map(ex => (
                   <option key={ex.value} value={ex.value}>{ex.label}</option>
                 ))}
               </Select>
               <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
-                Deribit: BTC-PERPETUAL · OKX: BTC-USD-SWAP · Bybit: BTCUSDT · CoInCall: BTCUSD-PERP
+                Spot and vol are both fetched from this exchange's ticker (e.g. Deribit: BTC-PERPETUAL + mark IV).
               </p>
             </FormGroup>
             <FormGroup>
-              <Label>Implied Vol Source</Label>
+              <Label>Trading Coin</Label>
               <Select
-                value={rfq.volSource}
-                onChange={e => upd({ volSource: e.target.value as RfqSettings['volSource'] })}
+                value={rfq.tradingCoin ?? 'BTC'}
+                onChange={e => upd({ tradingCoin: e.target.value.toUpperCase() })}
               >
-                {PRICER_EXCHANGES.map(ex => (
-                  <option key={ex.value} value={ex.value}>{ex.label}</option>
+                {['BTC', 'ETH', 'SOL', 'XRP', 'BNB'].map(c => (
+                  <option key={c} value={c}>{c}</option>
                 ))}
               </Select>
               <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
-                Fetches mark IV from the same option instrument on the selected exchange.
+                Only RFQ seeks containing this coin will be shown. Balance delta uses this coin's spot price.
+              </p>
+            </FormGroup>
+          </FormGrid>
+        </SectionBody>
+      </SectionCard>
+
+      <SectionCard>
+        <SectionHeader><h3>Greek-Aware Spread</h3></SectionHeader>
+        <SectionBody>
+          <p style={{ fontSize: '0.8rem', color: '#7e8b99', marginBottom: '0.75rem' }}>
+            Controls how your portfolio Greeks skew quotes. When you're long gamma, the pricer will shade prices higher
+            for trades that increase long gamma and lower for trades that reduce it — and vice versa for short gamma.
+          </p>
+          <FormGrid>
+            <FormGroup>
+              <Label>Base Spread (%)</Label>
+              <Input
+                type="number" step="0.1" min="0" max="50"
+                value={(rfq.baseSpread * 100).toFixed(2)}
+                onChange={e => upd({ baseSpread: Math.max(0, parseFloat(e.target.value) || 1) / 100 })}
+              />
+              <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
+                Minimum half-spread each side of mid (e.g. 1.0 = ±1%)
+              </p>
+            </FormGroup>
+            <FormGroup>
+              <Label>Max Skew (%)</Label>
+              <Input
+                type="number" step="0.5" min="0" max="50"
+                value={(rfq.maxSkew * 100).toFixed(1)}
+                onChange={e => upd({ maxSkew: Math.max(0, parseFloat(e.target.value) || 5) / 100 })}
+              />
+              <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
+                Cap on Greek-based skew (e.g. 5.0 = ±5% of mid)
+              </p>
+            </FormGroup>
+            <FormGroup>
+              <Label>Gamma Sensitivity</Label>
+              <Input
+                type="number" step="0.05" min="0" max="10"
+                value={(rfq.gammaSensitivity).toFixed(3)}
+                onChange={e => upd({ gammaSensitivity: Math.max(0, parseFloat(e.target.value) || 0) })}
+              />
+              <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
+                Higher = gamma imbalance skews price more aggressively
+              </p>
+            </FormGroup>
+            <FormGroup>
+              <Label>Vega Sensitivity</Label>
+              <Input
+                type="number" step="0.00005" min="0" max="1"
+                value={(rfq.vegaSensitivity).toFixed(4)}
+                onChange={e => upd({ vegaSensitivity: Math.max(0, parseFloat(e.target.value) || 0) })}
+              />
+              <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
+                Higher = vega imbalance skews price more aggressively
+              </p>
+            </FormGroup>
+          </FormGrid>
+        </SectionBody>
+      </SectionCard>
+
+      <SectionCard>
+        <SectionHeader><h3>Auto-Quote</h3></SectionHeader>
+        <SectionBody>
+          <p style={{ fontSize: '0.8rem', color: '#7e8b99', marginBottom: '0.75rem' }}>
+            When enabled, the pricer automatically prices and submits a quote for every new
+            incoming RFQ seek matching your trading coin. Quotes are auto-cancelled after the timeout.
+          </p>
+          <FormGrid>
+            <FormGroup>
+              <Label>Enable Auto-Quote</Label>
+              <CheckboxGroup>
+                <input
+                  type="checkbox"
+                  id="autoQuote"
+                  checked={rfq.autoQuote ?? false}
+                  onChange={e => upd({ autoQuote: e.target.checked })}
+                />
+                <label htmlFor="autoQuote" style={{ fontSize: '0.85rem', color: '#c8d6e5' }}>
+                  Auto-submit quote on new incoming seek
+                </label>
+              </CheckboxGroup>
+            </FormGroup>
+            <FormGroup>
+              <Label>Quote Timeout (seconds)</Label>
+              <Input
+                type="number" step="1" min="5" max="300"
+                value={rfq.autoQuoteTimeoutSecs ?? 30}
+                onChange={e => upd({ autoQuoteTimeoutSecs: Math.max(5, parseInt(e.target.value) || 30) })}
+              />
+              <p style={{ fontSize: '0.72rem', color: '#4a5568', margin: '0.2rem 0 0' }}>
+                Auto-cancel submitted quote after this many seconds
               </p>
             </FormGroup>
           </FormGrid>

@@ -8,10 +8,11 @@
 ///   4. Auto-reconnects with exponential backoff on disconnect
 ///
 /// Tauri events emitted:
-///   - `ws://order_update`    — payload: WsOrderUpdate
-///   - `ws://trade_update`    — payload: WsTradeUpdate
-///   - `ws://position_update` — payload: WsPositionUpdate
-///   - `ws://connection`      — payload: WsConnectionEvent
+///   - `ws://order_update`       — payload: WsOrderUpdate
+///   - `ws://trade_update`       — payload: WsTradeUpdate
+///   - `ws://position_update`    — payload: WsPositionUpdate
+///   - `ws://connection`         — payload: WsConnectionEvent
+///   - `ws://coincall_rfq_update` — payload: WsRfqUpdate (CoInCall block-trade channel)
 
 pub mod binance;
 pub mod bullish;
@@ -89,6 +90,20 @@ pub struct WsConnectionEvent {
     pub exchange: String,
     pub status: String, // "connected" | "disconnected" | "reconnecting" | "error"
     pub message: Option<String>,
+}
+
+/// Emitted when a CoInCall block-trade / RFQ event arrives on the options WS.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WsRfqUpdate {
+    pub account_id: String,
+    /// msgType: 1=ADD_SEEK 2=CANCEL_SEEK 3=EXPIRE_SEEK 4=ADD_QUOTE 5=CANCEL_QUOTE
+    ///           6=EXPIRE_QUOTE 7=DEAL_MM 8=MSG_MM 9=MSG_USER
+    pub msg_type: i64,
+    /// seekId / requestId this message relates to (if available)
+    pub request_id: Option<String>,
+    /// Raw JSON payload of `d.msg.content` for forward compatibility
+    pub raw: serde_json::Value,
 }
 
 // ── Connection handle ──────────────────────────────────────────────────────

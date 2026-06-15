@@ -115,19 +115,53 @@ pub struct RfqSettings {
     /// Exchange to fetch mark IV from: "deribit" | "okx" | "bybit" | "coincall".
     #[serde(default = "rfq_default_source")]
     pub vol_source: String,
+    /// Base half-spread as decimal (e.g. 0.01 = 1% either side of mid). Default 0.01.
+    #[serde(default = "rfq_default_base_spread")]
+    pub base_spread: f64,
+    /// How much portfolio gamma imbalance widens/skews quotes. Default 0.5.
+    #[serde(default = "rfq_default_gamma_sens")]
+    pub gamma_sensitivity: f64,
+    /// How much portfolio vega imbalance widens/skews quotes. Default 0.0005.
+    #[serde(default = "rfq_default_vega_sens")]
+    pub vega_sensitivity: f64,
+    /// Maximum Greek-based skew as decimal (e.g. 0.05 = ±5% of mid). Default 0.05.
+    #[serde(default = "rfq_default_max_skew")]
+    pub max_skew: f64,
+    /// Coin this account trades, used to filter incoming RFQs (e.g. "BTC" or "ETH"). Default "BTC".
+    #[serde(default = "rfq_default_coin")]
+    pub trading_coin: String,
+    /// Automatically price and submit a quote for every new incoming RFQ seek. Default false.
+    #[serde(default)]
+    pub auto_quote: bool,
+    /// Seconds before an auto-submitted quote is automatically cancelled. Default 30.
+    #[serde(default = "rfq_default_auto_quote_timeout")]
+    pub auto_quote_timeout_secs: u32,
 }
 
-fn rfq_default_rfr()    -> f64    { 0.05 }
-fn rfq_default_vol()    -> f64    { 0.80 }
-fn rfq_default_source() -> String { "deribit".to_string() }
+fn rfq_default_rfr()              -> f64    { 0.05 }
+fn rfq_default_vol()              -> f64    { 0.80 }
+fn rfq_default_source()           -> String { "deribit".to_string() }
+fn rfq_default_base_spread()      -> f64    { 0.01 }
+fn rfq_default_gamma_sens()       -> f64    { 0.5 }
+fn rfq_default_vega_sens()        -> f64    { 0.0005 }
+fn rfq_default_max_skew()         -> f64    { 0.05 }
+fn rfq_default_coin()             -> String { "BTC".to_string() }
+fn rfq_default_auto_quote_timeout() -> u32  { 30 }
 
 impl Default for RfqSettings {
     fn default() -> Self {
         Self {
-            risk_free_rate: rfq_default_rfr(),
-            default_vol:    rfq_default_vol(),
-            spot_source:    rfq_default_source(),
-            vol_source:     rfq_default_source(),
+            risk_free_rate:        rfq_default_rfr(),
+            default_vol:           rfq_default_vol(),
+            spot_source:           rfq_default_source(),
+            vol_source:            rfq_default_source(),
+            base_spread:           rfq_default_base_spread(),
+            gamma_sensitivity:     rfq_default_gamma_sens(),
+            vega_sensitivity:      rfq_default_vega_sens(),
+            max_skew:              rfq_default_max_skew(),
+            trading_coin:          rfq_default_coin(),
+            auto_quote:            false,
+            auto_quote_timeout_secs: rfq_default_auto_quote_timeout(),
         }
     }
 }
@@ -274,7 +308,10 @@ pub struct Ticker {
     pub best_ask_amount: Option<f64>,
     pub last_price: Option<f64>,
     pub mark_price: Option<f64>,
+    /// Spot/cash index price (e.g. Deribit BTC index, Bybit indexPrice)
     pub index_price: Option<f64>,
+    /// Forward/underlying price used for BS model (Deribit: underlying_price, Bybit: underlyingPrice, OKX: fwdPx, CoInCall: underlyingPrice)
+    pub underlying_price: Option<f64>,
     pub open_interest: Option<f64>,
     pub stats: TickerStats,
     pub mark_iv: Option<f64>,

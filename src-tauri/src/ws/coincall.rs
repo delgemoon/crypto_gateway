@@ -27,7 +27,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ws::{
     WsCommand, WsConnectionEvent, WsHandle, WsManager, WsOrderUpdate,
-    WsPositionUpdate, WsStatus, WsTradeUpdate,
+    WsPositionUpdate, WsRfqUpdate, WsStatus, WsTradeUpdate,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -159,11 +159,12 @@ async fn handle_session(
     let (mut sink, mut stream) = ws_stream.split();
 
     // Subscribe to each private channel separately using CoInCall's dataType format.
-    // Options WS: order(dt:11), trade(dt:15), position(dt:12), positionEvent(dt:27)
+    // Options WS: order(dt:11), trade(dt:15), position(dt:12), positionEvent(dt:27),
+    //             blockTrade(dt:20) — RFQ / block-trade notifications
     // Futures WS: order(dt:35), trade(dt:38)
     // Spot WS:    order(dt:35), trade(dt:38)  (same dt codes as futures on spot endpoint)
     let sub_channels: &[&str] = match channel {
-        "options" => &["order", "trade", "position", "positionEvent"],
+        "options" => &["order", "trade", "position", "positionEvent", "blockTrade"],
         _         => &["order", "trade"],  // futures + spot
     };
 
@@ -224,6 +225,7 @@ const DT_OPT_ORDER:    i64 = 11;
 const DT_OPT_TRADE:    i64 = 15;
 const DT_OPT_POSITION: i64 = 12;
 const DT_OPT_POS_EVT:  i64 = 27;
+const DT_BLOCK_TRADE:  i64 = 20;   // RFQ / block-trade channel
 // Futures WS
 const DT_FUT_ORDER:    i64 = 35;
 const DT_FUT_TRADE:    i64 = 38;
@@ -247,6 +249,11 @@ fn dispatch_message(app: &AppHandle, account_id: &str, is_options: bool, v: &Val
             DT_OPT_POSITION | DT_OPT_POS_EVT => {
                 if let Some(pos) = parse_options_position_update(account_id, data) {
                     let _ = app.emit("ws://position_update", &pos);
+                }
+            }
+            DT_BLOCK_TRADE => {
+                if let Some(update) = parse_block_trade_update(account_id, data) {
+                    let _ = app.emit("ws://coincall_rfq_update", &update);
                 }
             }
             _ => {}
@@ -436,6 +443,49 @@ fn parse_options_position_update(account_id: &str, p: &Value) -> Option<WsPositi
         gamma:           parse_f64(&p["gamma"]).unwrap_or(0.0),
         theta:           parse_f64(&p["theta"]).unwrap_or(0.0),
         vega:            parse_f64(&p["vega"]).unwrap_or(0.0),
+    })
+}
+
+/// Parse a block-trade/RFQ notification from options WS (dt:20).
+///
+/// The `d` field contains `{ "msg": { "msgType": N, "content": ... } }`.
+/// msgType meanings:
+///   1 ADD_SEEK  2 CANCEL_SEEK  3 EXPIRE_SEEK  4 ADD_QUOTE  5 CANCEL_QUOTE
+///   6 EXPIRE_QUOTE  7 DEAL_MM  8 MSG_MM  9 MSG_USER
+fn parse_block_trade_update(account_id: &str, d: &Value) -> Option<WsRfqUpdate> {
+    // CoInCall may wrap the payload in a "msg" field or send it flat in "d".
+    // Try both layouts:  d["msgType"]  or  d["msg"]["msgType"]
+    let msg_type = d["msgType"].as_i64()
+        .or_else(|| d["msg"]["msgType"].as_i64())
+        .unwrap_or(-1);
+
+    // Determine which node contains "content"
+    let content_node = if !d["content"].is_null() { &d["content"] }
+                       else { &d["msg"]["content"] };
+
+    let request_id = content_node["seekId"]
+        .as_i64().map(|n| n.to_string())
+        .or_else(|| content_node["seekId"].as_str().map(|s| s.to_string()))
+        .or_else(|| {
+            // Some msgTypes encode content as a JSON string containing an array
+            let s = content_node.as_str()?;
+            let arr: Value = serde_json::from_str(s).ok()?;
+            arr.as_array()?.first()?.as_i64().map(|n| n.to_string())
+        });
+
+    eprintln!(
+        "[coincall_ws][{}] block_trade dt:20 raw={} msgType:{} seekId:{:?}",
+        account_id,
+        serde_json::to_string(d).unwrap_or_default(),
+        msg_type,
+        request_id
+    );
+
+    Some(WsRfqUpdate {
+        account_id: account_id.to_string(),
+        msg_type,
+        request_id,
+        raw: d.clone(),
     })
 }
 

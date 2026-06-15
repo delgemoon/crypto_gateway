@@ -57,10 +57,22 @@ export interface RfqSettings {
   riskFreeRate: number;
   /** Fallback implied vol when market data unavailable (e.g. 0.80 = 80%) */
   defaultVol: number;
-  /** Exchange to pull spot/index price from */
-  spotSource: 'deribit' | 'okx' | 'bybit' | 'coincall';
-  /** Exchange to pull mark IV from */
-  volSource: 'deribit' | 'okx' | 'bybit' | 'coincall';
+  /** Exchange to pull both spot/index price and mark IV from */
+  pricerExchange: 'deribit' | 'okx' | 'bybit' | 'coincall';
+  /** Base half-spread around mid (e.g. 0.01 = 1% each side). Default 0.01. */
+  baseSpread: number;
+  /** How aggressively portfolio gamma skews the quote. Default 0.5. */
+  gammaSensitivity: number;
+  /** How aggressively portfolio vega skews the quote. Default 0.0005. */
+  vegaSensitivity: number;
+  /** Max Greek-based skew cap (e.g. 0.05 = ±5% of mid). Default 0.05. */
+  maxSkew: number;
+  /** Coin this account trades — filters incoming RFQs to only this coin. Default "BTC". */
+  tradingCoin: string;
+  /** Automatically price and submit a quote for every new incoming RFQ seek. Default false. */
+  autoQuote: boolean;
+  /** Seconds after which an auto-submitted quote is automatically cancelled. Default 30. */
+  autoQuoteTimeoutSecs: number;
 }
 
 // ── General Settings ───────────────────────────────────────────────────────
@@ -141,8 +153,14 @@ const initialState: SettingsState = {
   rfq: {
     riskFreeRate: 0.05,
     defaultVol: 0.80,
-    spotSource: 'deribit',
-    volSource: 'deribit',
+    pricerExchange: 'deribit',
+    baseSpread: 0.01,
+    gammaSensitivity: 0.5,
+    vegaSensitivity: 0.0005,
+    maxSkew: 0.05,
+    tradingCoin: 'BTC',
+    autoQuote: false,
+    autoQuoteTimeoutSecs: 30,
   },
   client: {
     companyName: '',

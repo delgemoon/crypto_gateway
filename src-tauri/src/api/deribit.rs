@@ -97,6 +97,8 @@ fn parse_ticker(v: &Value) -> Result<Ticker, String> {
         last_price: v["last_price"].as_f64(),
         mark_price: v["mark_price"].as_f64(),
         index_price: v["index_price"].as_f64(),
+        // Deribit provides underlying_price (forward) separately from index_price (spot)
+        underlying_price: v["underlying_price"].as_f64(),
         open_interest: v["open_interest"].as_f64(),
         stats: TickerStats {
             high: stats["high"].as_f64(),

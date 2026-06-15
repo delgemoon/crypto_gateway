@@ -219,6 +219,8 @@ pub struct LegPriceInput {
     pub quoted_price: f64,
     /// Override spot price for this leg's underlying (0 = use spot_prices map)
     pub spot_override: Option<f64>,
+    /// Override implied vol for this leg (0 = use default_vol)
+    pub vol_override: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,8 +273,10 @@ pub fn price_leg(
         };
     }
 
-    // Compute IV from quoted price, fall back to default_vol
-    let iv = if leg.quoted_price > 0.0 {
+    // Compute IV: use vol_override if provided, else from quoted_price, else default_vol
+    let iv = if let Some(vo) = leg.vol_override.filter(|&v| v > 0.0) {
+        vo
+    } else if leg.quoted_price > 0.0 {
         implied_vol(leg.quoted_price, s, opt.strike, t, risk_free_rate, opt.is_call)
             .unwrap_or(default_vol)
     } else {

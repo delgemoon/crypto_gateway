@@ -162,6 +162,7 @@ pub async fn fetch_ticker(instrument_name: &str) -> Result<Ticker, String> {
         last_price:      stats["lastPrice"].as_str().and_then(|s| s.parse().ok()),
         mark_price:      None,
         index_price:     None,
+        underlying_price: None,
         open_interest:   stats["openInterest"].as_str().and_then(|s| s.parse().ok()),
         mark_iv:         None,
         bid_iv:          None,

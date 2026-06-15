@@ -206,6 +206,7 @@ pub async fn fetch_ticker(instrument_name: &str) -> Result<Ticker, String> {
         last_price:       pf(&t["last"]),
         mark_price:       pf(&t["currentPrice"]),
         index_price:      pf(&t["currentPrice"]),
+        underlying_price: None,
         open_interest:    None,
         stats: TickerStats {
             high:         pf(&t["high"]),

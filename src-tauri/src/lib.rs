@@ -807,11 +807,13 @@ async fn get_coincall_ws_url(
 async fn coincall_get_rfq_list(
     state: tauri::State<'_, AppState>,
     account_id: String,
+    role: Option<String>,
+    rfq_state: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let accounts = db::accounts::get_all(&state.pool, &state.enc_key)?;
     let account = accounts.into_iter().find(|a| a.id == account_id)
         .ok_or_else(|| "Account not found".to_string())?;
-    api::coincall::get_rfq_list(&account).await
+    api::coincall::get_rfq_list(&account, role.as_deref(), rfq_state.as_deref()).await
 }
 
 #[tauri::command]
@@ -869,6 +871,32 @@ async fn coincall_accept_quote(
 // ── RFQ Settings & Pricing ─────────────────────────────────────────────────
 
 #[tauri::command]
+async fn coincall_create_quote(
+    state: tauri::State<'_, AppState>,
+    account_id: String,
+    request_id: String,
+    quote_side: Option<String>,
+    legs: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let accounts = db::accounts::get_all(&state.pool, &state.enc_key)?;
+    let account = accounts.into_iter().find(|a| a.id == account_id)
+        .ok_or_else(|| "Account not found".to_string())?;
+    api::coincall::create_quote(&request_id, quote_side.as_deref(), &legs, &account).await
+}
+
+#[tauri::command]
+async fn coincall_cancel_quote(
+    state: tauri::State<'_, AppState>,
+    account_id: String,
+    quote_id: String,
+) -> Result<(), String> {
+    let accounts = db::accounts::get_all(&state.pool, &state.enc_key)?;
+    let account = accounts.into_iter().find(|a| a.id == account_id)
+        .ok_or_else(|| "Account not found".to_string())?;
+    api::coincall::cancel_quote(&quote_id, &account).await
+}
+
+#[tauri::command]
 fn get_rfq_settings(state: tauri::State<'_, AppState>) -> Result<RfqSettings, String> {
     db::rfq_settings::get_rfq(&state.pool)
 }
@@ -881,6 +909,78 @@ fn save_rfq_settings(
     db::rfq_settings::save_rfq(&state.pool, &settings)
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PortfolioGreeks {
+    /// Net delta from option + futures positions only
+    pub position_delta: f64,
+    pub gamma: f64,
+    pub vega:  f64,
+    pub theta: f64,
+    pub position_count: usize,
+    /// Coin balance (e.g. BTC held directly) — each unit = 1 delta
+    pub coin_balance: f64,
+    /// USDT/USD balance
+    pub usdt_balance: f64,
+    /// Spot price used to convert USDT → coin delta
+    pub spot_price: f64,
+    /// Balance delta = coin_balance + usdt_balance / spot_price
+    pub balance_delta: f64,
+    /// Total delta = position_delta + balance_delta
+    pub total_delta: f64,
+}
+
+/// Fetch and sum portfolio Greeks from positions + wallet balances.
+/// balance_delta = coin_balance + usdt_balance / spot_price
+/// total_delta   = position_delta + balance_delta
+#[tauri::command]
+async fn get_portfolio_greeks(
+    account_id: String,
+    trading_coin: String,
+    state: tauri::State<'_, AppState>,
+) -> Result<PortfolioGreeks, String> {
+    let coin = trading_coin.trim().to_ascii_uppercase();
+    let accounts = db::accounts::get_all(&state.pool, &state.enc_key)?;
+    let account = accounts.into_iter().find(|a| a.id == account_id)
+        .ok_or_else(|| "Account not found".to_string())?;
+
+    // Fetch positions + account balances + spot price concurrently
+    let perp_instrument = format!("{}-PERPETUAL", coin);
+    let (positions_res, summary_res, spot_res) = tokio::join!(
+        api::coincall::get_positions("", &account),
+        api::coincall::get_full_balances(&account),
+        api::deribit::fetch_ticker(&perp_instrument),
+    );
+
+    // Sum position Greeks (signed by direction)
+    let positions = positions_res.unwrap_or_default();
+    let mut pos_delta = 0.0_f64;
+    let mut gamma     = 0.0_f64;
+    let mut vega      = 0.0_f64;
+    let mut theta     = 0.0_f64;
+    for p in &positions {
+        let sign = if p.direction == "long" { 1.0_f64 } else { -1.0_f64 };
+        pos_delta += sign * p.delta * p.size;
+        gamma     += sign * p.gamma * p.size;
+        vega      += sign * p.vega  * p.size;
+        theta     += sign * p.theta * p.size;
+    }
+
+    // Balance delta: coin_balance + usdt_balance / spot
+    let (coin_balance, usdt_balance) = summary_res.unwrap_or((0.0, 0.0));
+    let spot_price = spot_res.ok().and_then(|t| t.index_price).unwrap_or(0.0);
+    let balance_delta = coin_balance + if spot_price > 0.0 { usdt_balance / spot_price } else { 0.0 };
+    let total_delta = pos_delta + balance_delta;
+
+    Ok(PortfolioGreeks {
+        position_delta: pos_delta,
+        gamma, vega, theta,
+        position_count: positions.len(),
+        coin_balance, usdt_balance, spot_price,
+        balance_delta, total_delta,
+    })
+}
+
 /// Fetch index price and/or mark IV for an underlying from the specified exchange.
 /// underlying: e.g. "BTC", "ETH"
 /// exchange: "deribit" | "okx" | "bybit" | "coincall"
@@ -888,10 +988,21 @@ fn save_rfq_settings(
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PricingMarketData {
-    pub index_price:     Option<f64>,
-    pub mark_iv:         Option<f64>,
-    pub instrument_used: String,
-    pub error:           Option<String>,
+    pub index_price:      Option<f64>,
+    pub underlying_price: Option<f64>,
+    pub mark_price:       Option<f64>,
+    /// Pre-computed fair value in USD (exchange-native, no client-side conversion needed).
+    /// Deribit: mark_price (BTC) × underlying_price. Bybit/CoInCall: mark_price (already USD).
+    pub fair_value_usd:   Option<f64>,
+    pub bid_price:        Option<f64>,
+    pub ask_price:        Option<f64>,
+    pub mark_iv:          Option<f64>,
+    pub delta:            Option<f64>,
+    pub gamma:            Option<f64>,
+    pub vega:             Option<f64>,
+    pub theta:            Option<f64>,
+    pub instrument_used:  String,
+    pub error:            Option<String>,
 }
 
 #[tauri::command]
@@ -904,6 +1015,19 @@ async fn fetch_pricing_market_data(
     let tn = testnet.unwrap_or(false);
     let coin = underlying.trim_end_matches("USD").trim_end_matches("USDT").to_ascii_uppercase();
 
+    // CoInCall has no public index/perpetual endpoint — index price comes from the option
+    // ticker's indexPrice/underlyingPrice fields, which are fetched in fetch_option_market_data.
+    // Return an empty (no-error) result; the frontend will use the option ticker data.
+    if exchange == "coincall" && instrument_override.is_none() {
+        return Ok(PricingMarketData {
+            index_price: None, underlying_price: None, mark_price: None,
+            fair_value_usd: None, bid_price: None, ask_price: None,
+            mark_iv: None, delta: None, gamma: None, vega: None, theta: None,
+            instrument_used: format!("{}_from_option_ticker", coin),
+            error: None,
+        });
+    }
+
     // Determine which perpetual/spot instrument to hit for index price
     let instrument_name = if let Some(ov) = instrument_override {
         ov
@@ -912,7 +1036,6 @@ async fn fetch_pricing_market_data(
             "deribit"  => format!("{}-PERPETUAL", coin),
             "okx"      => format!("{}-USD-SWAP", coin),
             "bybit"    => format!("{}USDT", coin),
-            "coincall" => format!("{}USD-PERP", coin),
             other      => return Err(format!("Unknown exchange: {}", other)),
         }
     };
@@ -927,22 +1050,39 @@ async fn fetch_pricing_market_data(
 
     match result {
         Ok(t) => Ok(PricingMarketData {
-            index_price:     t.index_price,
-            mark_iv:         t.mark_iv,
-            instrument_used: instrument_name,
-            error:           None,
+            index_price:      t.index_price,
+            underlying_price: t.underlying_price,
+            mark_price:       t.mark_price,
+            fair_value_usd:   None, // spot/perp ticker — no option mark price
+            bid_price:        t.best_bid_price,
+            ask_price:        t.best_ask_price,
+            mark_iv:          t.mark_iv,
+            delta:            t.delta,
+            gamma:            t.gamma,
+            vega:             t.vega,
+            theta:            t.theta,
+            instrument_used:  instrument_name,
+            error:            None,
         }),
         Err(e) => Ok(PricingMarketData {
-            index_price:     None,
-            mark_iv:         None,
-            instrument_used: instrument_name,
-            error:           Some(e),
+            index_price:      None,
+            underlying_price: None,
+            mark_price:       None,
+            fair_value_usd:   None,
+            bid_price:        None,
+            ask_price:        None,
+            mark_iv:          None,
+            delta:            None,
+            gamma:            None,
+            vega:             None,
+            theta:            None,
+            instrument_used:  instrument_name,
+            error:            Some(e),
         }),
     }
 }
 
-/// Fetch mark IV for a specific option instrument from the given exchange.
-/// Used to get vol_source market data per option leg.
+/// Fetch full option market data (markIv, greeks, index/underlying price) per exchange.
 #[tauri::command]
 async fn fetch_option_market_data(
     instrument_name: String,
@@ -950,26 +1090,115 @@ async fn fetch_option_market_data(
     testnet: Option<bool>,
 ) -> Result<PricingMarketData, String> {
     let tn = testnet.unwrap_or(false);
+    // Each exchange has the best endpoint for option analytics:
+    // - Deribit:  /public/ticker    — mark_price in BTC; fair_usd = mark × underlying
+    // - OKX:      /public/opt-summary — markVol + greeks + fwdPx; no markPx → no fair_usd
+    // - Bybit:    /v5/market/tickers  — mark_price in USD directly
+    // - CoInCall: /open/option/detail/v1 — mark_price in USD directly
     let result: Result<Ticker, String> = match exchange.as_str() {
         "deribit"  => api::deribit::fetch_ticker(&instrument_name).await,
-        "okx"      => api::okx::fetch_ticker(&instrument_name).await,
+        "okx"      => api::okx::fetch_option_ticker(&instrument_name).await,
         "bybit"    => api::bybit::fetch_ticker(&instrument_name).await,
         "coincall" => api::coincall::fetch_ticker(&instrument_name, tn).await,
         other      => Err(format!("Unsupported exchange: {}", other)),
     };
     match result {
-        Ok(t) => Ok(PricingMarketData {
-            index_price:     t.index_price,
-            mark_iv:         t.mark_iv,
-            instrument_used: instrument_name,
-            error:           None,
-        }),
+        Ok(t) => {
+            // Compute fair_value_usd per exchange mark_price convention:
+            // Deribit mark_price is in BTC → multiply by underlying (forward) to get USD.
+            // Bybit / CoInCall mark_price is already in USD.
+            // OKX opt-summary has no markPx → None.
+            let fair_value_usd = match exchange.as_str() {
+                "deribit" => match (t.mark_price, t.underlying_price.or(t.index_price)) {
+                    (Some(mp), Some(fwd)) => Some(mp * fwd),
+                    _ => None,
+                },
+                "bybit" | "coincall" => t.mark_price,
+                _ => None,
+            };
+            Ok(PricingMarketData {
+                index_price:      t.index_price,
+                underlying_price: t.underlying_price,
+                mark_price:       t.mark_price,
+                fair_value_usd,
+                bid_price:        t.best_bid_price,
+                ask_price:        t.best_ask_price,
+                mark_iv:          t.mark_iv,
+                delta:            t.delta,
+                gamma:            t.gamma,
+                vega:             t.vega,
+                theta:            t.theta,
+                instrument_used:  instrument_name,
+                error:            None,
+            })
+        },
         Err(e) => Ok(PricingMarketData {
-            index_price:     None,
-            mark_iv:         None,
-            instrument_used: instrument_name,
-            error:           Some(e),
+            index_price:      None,
+            underlying_price: None,
+            mark_price:       None,
+            fair_value_usd:   None,
+            bid_price:        None,
+            ask_price:        None,
+            mark_iv:          None,
+            delta:            None,
+            gamma:            None,
+            vega:             None,
+            theta:            None,
+            instrument_used:  instrument_name,
+            error:            Some(e),
         }),
+    }
+}
+
+/// Fetch option orderbook for a given instrument and exchange.
+/// Returns top N levels (depth=10). Prices are normalized to USD per underlying unit.
+#[tauri::command]
+async fn fetch_option_orderbook(
+    instrument_name: String,
+    exchange: String,
+    testnet: Option<bool>,
+) -> Result<api::models::OrderbookSnapshot, String> {
+    use api::models::{OrderbookLevel, OrderbookSnapshot};
+    let tn = testnet.unwrap_or(false);
+    let depth = 10u32;
+    let ts_now = || std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    match exchange.as_str() {
+        "deribit" => api::deribit::fetch_orderbook(&instrument_name, depth).await,
+        "bybit"   => api::bybit::fetch_orderbook(&instrument_name, depth).await,
+
+        "okx" => {
+            // OKX inverse option prices are in USD per-contract.
+            // All BTC/ETH/SOL OKX options have ctMult=0.01, so price × 100 = USD per underlying.
+            let mut ob = api::okx::fetch_orderbook(&instrument_name, depth).await?;
+            let scale = 100.0_f64; // 1 / ctMult (0.01)
+            for lvl in &mut ob.bids { lvl.price *= scale; }
+            for lvl in &mut ob.asks { lvl.price *= scale; }
+            Ok(ob)
+        }
+
+        "coincall" => {
+            // CoInCall's /md/orderbook uses a numeric instrumentId — not the symbol string.
+            // Use the option detail ticker instead, which provides best bid/ask in USD.
+            let t = api::coincall::fetch_ticker(&instrument_name, tn).await?;
+            let ts = ts_now();
+            let bids = match (t.best_bid_price, t.best_bid_amount) {
+                (Some(p), Some(s)) if p > 0.0 => vec![OrderbookLevel { price: p, size: s }],
+                (Some(p), None)    if p > 0.0 => vec![OrderbookLevel { price: p, size: 1.0 }],
+                _ => vec![],
+            };
+            let asks = match (t.best_ask_price, t.best_ask_amount) {
+                (Some(p), Some(s)) if p > 0.0 => vec![OrderbookLevel { price: p, size: s }],
+                (Some(p), None)    if p > 0.0 => vec![OrderbookLevel { price: p, size: 1.0 }],
+                _ => vec![],
+            };
+            Ok(OrderbookSnapshot { instrument_name, bids, asks, timestamp: ts })
+        }
+
+        other => Err(format!("Unsupported exchange: {}", other)),
     }
 }
 
@@ -1214,10 +1443,14 @@ pub fn run() {
             coincall_get_rfq_quotes,
             coincall_accept_quote,
             coincall_get_rfq_list,
+            coincall_create_quote,
+            coincall_cancel_quote,
             get_rfq_settings,
             save_rfq_settings,
+            get_portfolio_greeks,
             fetch_pricing_market_data,
             fetch_option_market_data,
+            fetch_option_orderbook,
             price_rfq_legs,
             get_coincall_ws_url,
             ws_connect,
