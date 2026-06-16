@@ -29,6 +29,8 @@ interface TransactionLog {
   position: number;
   baseCurrency: string;
   quoteCurrency: string;
+  /** Bybit: funding fee in this row (separate from fee); others: 0 */
+  funding: number;
 }
 
 // ── Styled ───────────────────────────────────────────────────────────────────
@@ -231,6 +233,8 @@ const PnlPanel: React.FC = () => {
   const [loading, setLoading]     = useState(false);
   const [error, setError]         = useState<string | null>(null);
   const [currency, setCurrency]   = useState<string>('ALL');
+  const [filterBase, setFilterBase]   = useState<string>('ALL');
+  const [filterQuote, setFilterQuote] = useState<string>('ALL');
   const [pageSize, setPageSize]   = useState<number>(100);
   const [page, setPage]           = useState<number>(0);
 
@@ -247,6 +251,8 @@ const PnlPanel: React.FC = () => {
       });
       setAllLogs(result);
       setCurrency('ALL');
+      setFilterBase('ALL');
+      setFilterQuote('ALL');
     } catch (e: any) {
       setError(String(e));
       setAllLogs([]);
@@ -262,11 +268,24 @@ const PnlPanel: React.FC = () => {
     return ['ALL', ...Array.from(seen).sort()];
   }, [allLogs]);
 
+  const bases = useMemo(() => {
+    const seen = new Set<string>();
+    allLogs.forEach(l => { if (l.baseCurrency) seen.add(l.baseCurrency); });
+    return ['ALL', ...Array.from(seen).sort()];
+  }, [allLogs]);
+
+  const quotes = useMemo(() => {
+    const seen = new Set<string>();
+    allLogs.forEach(l => { if (l.quoteCurrency) seen.add(l.quoteCurrency); });
+    return ['ALL', ...Array.from(seen).sort()];
+  }, [allLogs]);
+
   // Filtered logs
-  const filtered = useMemo(
-    () => currency === 'ALL' ? allLogs : allLogs.filter(l => l.currency === currency),
-    [allLogs, currency]
-  );
+  const filtered = useMemo(() => allLogs.filter(l =>
+    (currency    === 'ALL' || l.currency     === currency) &&
+    (filterBase  === 'ALL' || l.baseCurrency === filterBase) &&
+    (filterQuote === 'ALL' || l.quoteCurrency === filterQuote)
+  ), [allLogs, currency, filterBase, filterQuote]);
 
   // Summary over filtered (all pages)
   const totalPnl  = filtered.reduce((s, l) => s + l.profitAsCashflow, 0);
@@ -308,6 +327,16 @@ const PnlPanel: React.FC = () => {
             <Label style={{ marginLeft: 4 }}>Currency</Label>
             <Select value={currency} onChange={e => { setCurrency(e.target.value); setPage(0); }}>
               {currencies.map(c => <option key={c} value={c}>{c}</option>)}
+            </Select>
+
+            <Label>Base</Label>
+            <Select value={filterBase} onChange={e => { setFilterBase(e.target.value); setPage(0); }}>
+              {bases.map(b => <option key={b} value={b}>{b}</option>)}
+            </Select>
+
+            <Label>Quote</Label>
+            <Select value={filterQuote} onChange={e => { setFilterQuote(e.target.value); setPage(0); }}>
+              {quotes.map(q => <option key={q} value={q}>{q}</option>)}
             </Select>
 
             <Label>Show</Label>
@@ -366,6 +395,8 @@ const PnlPanel: React.FC = () => {
                 <Th>Time</Th>
                 <Th>Type</Th>
                 <Th>Instrument</Th>
+                <Th>Base</Th>
+                <Th>Quote</Th>
                 <Th>Side</Th>
                 <Th>Amount</Th>
                 <Th>Price</Th>
@@ -373,6 +404,7 @@ const PnlPanel: React.FC = () => {
                 <Th>Mark</Th>
                 <Th>Index</Th>
                 <Th>Fee</Th>
+                <Th>Funding</Th>
                 <Th>P&amp;L</Th>
                 <Th>Change</Th>
                 <Th>Balance</Th>
@@ -388,7 +420,9 @@ const PnlPanel: React.FC = () => {
                   <tr key={l.id || i}>
                     <Td $align="left">{fmtTs(l.timestamp)}</Td>
                     <Td $align="left" $color="#8b949e">{TYPE_LABELS[l.transactionType] ?? l.transactionType}</Td>
-                    <Td $align="left">{l.instrumentName || '-'}</Td>
+                    <Td $align="left">{l.instrumentName || l.currency || '-'}</Td>
+                    <Td $align="left" $color="#8b949e">{l.baseCurrency || '-'}</Td>
+                    <Td $align="left" $color="#8b949e">{l.quoteCurrency || '-'}</Td>
                     <Td $color={sideColor}>{l.side ? l.side.toUpperCase() : '-'}</Td>
                     <Td>{fmt(l.amount)}</Td>
                     <Td>{fmt(l.price)}</Td>
@@ -396,6 +430,7 @@ const PnlPanel: React.FC = () => {
                     <Td>{l.markPrice > 0 ? fmt(l.markPrice) : '-'}</Td>
                     <Td $color="#8b949e">{l.indexPrice > 0 ? fmt(l.indexPrice) : '-'}</Td>
                     <Td $color={l.fee !== 0 ? '#f85149' : undefined}>{fmt(l.fee, 6)}</Td>
+                    <Td $color={l.funding !== 0 ? (l.funding > 0 ? '#3fb950' : '#f85149') : undefined}>{l.funding !== 0 ? fmt(l.funding, 6) : '-'}</Td>
                     <Td $color={pnlColor}>{fmt(l.profitAsCashflow, 6)}</Td>
                     <Td $color={l.change > 0 ? '#3fb950' : l.change < 0 ? '#f85149' : undefined}>{fmt(l.change, 6)}</Td>
                     <Td>{fmt(l.balance, 4)}</Td>

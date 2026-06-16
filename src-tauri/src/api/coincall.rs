@@ -1185,6 +1185,7 @@ pub async fn get_transaction_log(
                         position:           t["qty"].as_f64().unwrap_or(0.0) * t["price"].as_f64().unwrap_or(0.0),
                         base_currency,
                         quote_currency,
+                        funding:            0.0,
                     });
                 }
 
@@ -1260,6 +1261,7 @@ pub async fn get_transaction_log(
                         position:           t["qty"].as_f64().unwrap_or(0.0) * t["price"].as_f64().unwrap_or(0.0),
                         base_currency,
                         quote_currency,
+                        funding:            0.0,
                     });
                 }
 
@@ -1324,6 +1326,7 @@ pub async fn get_transaction_log(
                         position:           t["qty"].as_f64().or_else(|| t["qty"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0) * t["price"].as_f64().or_else(|| t["price"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0),
                         base_currency,
                         quote_currency,
+                        funding:            0.0,
                     });
                 }
             }
@@ -1399,6 +1402,7 @@ pub async fn get_transaction_log(
                     position:           0.0,
                     base_currency:      coin,
                     quote_currency:     String::new(),
+                    funding:            0.0,
                 });
             }
 
@@ -1480,6 +1484,7 @@ pub async fn get_transaction_log(
                     position:           0.0,
                     base_currency:      coin,
                     quote_currency:     String::new(),
+                    funding:            0.0,
                 });
             }
 
@@ -1545,6 +1550,7 @@ pub async fn get_transaction_log(
                     position:           0.0,
                     base_currency,
                     quote_currency,
+                    funding:            0.0,
                 });
             }
             let total: u32 = resp["data"]["total"].as_u64().unwrap_or(0) as u32;
@@ -1613,6 +1619,7 @@ pub async fn get_transaction_log(
                     position:           price * qty,
                     base_currency,
                     quote_currency,
+                    funding:            0.0,
                 });
             }
             let total: u32 = resp["data"]["total"].as_u64().unwrap_or(0) as u32;
@@ -1700,6 +1707,7 @@ pub async fn get_transaction_log(
                     position:           price * amount,
                     base_currency,
                     quote_currency,
+                    funding:            0.0,
                 });
             }
             let total: u32 = resp["data"]["total"].as_u64().unwrap_or(0) as u32;

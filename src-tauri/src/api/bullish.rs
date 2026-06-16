@@ -561,6 +561,7 @@ pub async fn get_transaction_log(
                 position:           pf0(&fill["quantity"]) * pf0(&fill["price"]),
                 base_currency,
                 quote_currency,
+                funding:            0.0,
             });
         }
 

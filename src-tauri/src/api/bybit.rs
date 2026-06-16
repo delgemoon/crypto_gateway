@@ -722,8 +722,6 @@ pub async fn get_transaction_log(
             for e in &list {
                 let settle_ccy = e["currency"].as_str().unwrap_or("").to_string();
                 let symbol     = e["symbol"].as_str().unwrap_or("");
-                // Use base coin (BTC, ETH, SOL…) for grouping/filtering,
-                // keep settlement currency (USDT, USDC…) in fee_currency.
                 let base_coin  = if symbol.is_empty() {
                     settle_ccy.clone()
                 } else {
@@ -748,7 +746,8 @@ pub async fn get_transaction_log(
                     price:              e["tradePrice"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     fee:                e["fee"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     fee_currency:       settle_ccy.clone(),
-                    currency:           base_coin.clone(),
+                    // Keep exchange-provided settlement currency (USDT, USDC…) as currency
+                    currency:           settle_ccy.clone(),
                     profit_as_cashflow: e["cashFlow"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     balance:            e["cashBalance"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     change:             e["change"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
@@ -757,12 +756,12 @@ pub async fn get_transaction_log(
                     info:               String::new(),
                     mark_price:         0.0,
                     index_price:        0.0,
-                    // Bybit's cashBalance already IS the post-transaction wallet balance.
-                    // Equity (wallet + unrealized PnL) is not available in the tx log.
                     equity:             0.0,
-                    position:          e["size" ].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
+                    position:           e["size"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                     base_currency:      base_coin.clone(),
                     quote_currency:     settle_ccy.clone(),
+                    // Bybit reports funding separately from fee in each SETTLEMENT row
+                    funding:            e["funding"].as_str().and_then(|s| s.parse().ok()).unwrap_or(0.0),
                 });
             }
             let next_cursor = resp["result"]["nextPageCursor"].as_str().unwrap_or("").to_string();
@@ -964,6 +963,7 @@ async fn fetch_deposit_withdrawal_logs(
                 position:           0.0,
                 base_currency:      coin.clone(),
                 quote_currency:     coin.clone(),
+                funding:            0.0,
             });
         }
         let next = resp["result"]["nextPageCursor"].as_str().unwrap_or("").to_string();

@@ -157,7 +157,7 @@ pub async fn get_transaction_log(
     match account.exchange.as_str() {
         "deribit" => {
             // Deribit is per-currency; fetch BTC, ETH, SOL, USDC and merge
-            let currencies = ["BTC", "ETH", "SOL", "USDC"];
+            let currencies = ["BTC", "ETH", "SOL", "USDC", "USDT", "USED", "STETH", "BUIDL", "BNB", "PAXG", "USYC"];
             let mut all: Vec<TransactionLog> = Vec::new();
             for cur in &currencies {
                 match deribit::get_transaction_log(

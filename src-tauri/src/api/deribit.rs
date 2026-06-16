@@ -683,8 +683,37 @@ pub async fn get_transaction_log(
                 index_price:        f64_val(&e["index_price"]),
                 equity:             f64_val(&e["equity"]),  // Deribit provides equity directly
                 position:           f64_val(&e["position"]),
-                base_currency:      e["base_currency"].as_str().unwrap_or("BTC").to_string(),
-                quote_currency:     e["quote_currency"].as_str().unwrap_or("USD").to_string(),
+                // Deribit rarely includes base_currency/quote_currency in tx log entries.
+                // Instrument formats:
+                //   "BTC-PERPETUAL"        → base=BTC, quote=USD
+                //   "ETH-15MAR25-3000-C"   → base=ETH, quote=USD
+                //   "BTC_USDT"             → base=BTC, quote=USDT  (spot, underscore separator)
+                base_currency: {
+                    let from_json = e["base_currency"].as_str().unwrap_or("");
+                    if !from_json.is_empty() {
+                        from_json.to_string()
+                    } else {
+                        let instr = e["instrument_name"].as_str().unwrap_or("");
+                        // try dash separator first, then underscore
+                        let sep = if instr.contains('-') { '-' } else { '_' };
+                        instr.split(sep).next().filter(|s| !s.is_empty()).unwrap_or(currency).to_string()
+                    }
+                },
+                quote_currency: {
+                    let from_json = e["quote_currency"].as_str().unwrap_or("");
+                    if !from_json.is_empty() {
+                        from_json.to_string()
+                    } else {
+                        // BTC_USDT spot → extract quote after underscore
+                        let instr = e["instrument_name"].as_str().unwrap_or("");
+                        if instr.contains('_') {
+                            instr.split('_').nth(1).unwrap_or("USD").to_string()
+                        } else {
+                            "USD".to_string()
+                        }
+                    }
+                },
+                funding:            0.0,
             });
         }
 

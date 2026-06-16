@@ -423,6 +423,8 @@ pub struct TransactionLog {
     pub base_currency: String,
     /// Quote currency of the instrument (e.g., USD)
     pub quote_currency: String,
+    /// Funding fee for this entry (Bybit: separate funding field; others: 0)
+    pub funding: f64,
 }
 
 // ── Place Order Request ────────────────────────────────────────────────────
