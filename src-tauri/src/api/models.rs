@@ -387,6 +387,8 @@ pub struct TransactionLog {
     /// "trade" | "delivery" | "settlement" | "transfer_in" | "transfer_out"
     /// | "deposit" | "withdrawal" | "fee" | "funding" | "option_exercise" | "other"
     pub transaction_type: String,
+    /// Exchange-specific category (e.g. Bybit: linear/inverse/option/spot)
+    pub category: String,
     /// "buy" | "sell" | "" (empty for non-directional entries)
     pub side: String,
     /// Trade quantity / transfer amount

@@ -540,6 +540,7 @@ pub async fn get_transaction_log(
                 timestamp:          ts,
                 instrument_name:    symbol.to_string(),
                 transaction_type:   "trade".to_string(),
+                category:           String::new(),
                 side:               match fill["side"].as_str().unwrap_or("BUY") {
                                         "SELL" => "sell".to_string(),
                                         _      => "buy".to_string(),

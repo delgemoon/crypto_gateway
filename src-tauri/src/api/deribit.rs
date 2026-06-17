@@ -667,6 +667,7 @@ pub async fn get_transaction_log(
                 timestamp:          ts,
                 instrument_name:    e["instrument_name"].as_str().unwrap_or("").to_string(),
                 transaction_type:   tx_type,
+                category:           String::new(),
                 side:               e["side"].as_str().unwrap_or("").to_string(),
                 amount:             f64_val(&e["amount"]),
                 price:              f64_val(&e["price"]),

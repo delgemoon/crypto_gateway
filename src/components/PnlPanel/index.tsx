@@ -10,6 +10,7 @@ interface TransactionLog {
   timestamp: number;
   instrumentName: string;
   transactionType: string;
+  category: string;
   side: string;
   amount: number;
   price: number;
@@ -395,6 +396,7 @@ const PnlPanel: React.FC = () => {
                 <Th>Time</Th>
                 <Th>Type</Th>
                 <Th>Instrument</Th>
+                <Th>Category</Th>
                 <Th>Base</Th>
                 <Th>Quote</Th>
                 <Th>Side</Th>
@@ -421,6 +423,7 @@ const PnlPanel: React.FC = () => {
                     <Td $align="left">{fmtTs(l.timestamp)}</Td>
                     <Td $align="left" $color="#8b949e">{TYPE_LABELS[l.transactionType] ?? l.transactionType}</Td>
                     <Td $align="left">{l.instrumentName || l.currency || '-'}</Td>
+                    <Td $align="left" $color="#8b949e">{l.category || '-'}</Td>
                     <Td $align="left" $color="#8b949e">{l.baseCurrency || '-'}</Td>
                     <Td $align="left" $color="#8b949e">{l.quoteCurrency || '-'}</Td>
                     <Td $color={sideColor}>{l.side ? l.side.toUpperCase() : '-'}</Td>
