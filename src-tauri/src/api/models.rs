@@ -11,7 +11,8 @@ pub struct Account {
     pub exchange: String,
     /// CeFi: API key  |  DeFi: wallet address (public)
     pub api_key: String,
-    /// CeFi: API secret  |  DeFi: private key (encrypted)
+    /// CeFi: API secret  |  DeFi: private key (encrypted).
+    /// Uniswap Safe multisig accepts comma-separated owner private keys.
     pub api_secret: String,
     /// Required for OKX
     #[serde(default)]

@@ -290,7 +290,7 @@ const ExchangeTab: FunctionComponent = () => {
     e.preventDefault();
     if (!form.name?.trim()) { setError('Account name is required'); return; }
     if (!form.apiKey?.trim()) { setError('Wallet/API Key is required'); return; }
-    if (!form.apiSecret?.trim()) { setError('Private Key/API Secret is required'); return; }
+    if (!form.apiSecret?.trim()) { setError('Private Key(s)/API Secret is required'); return; }
     if (form.exchange === 'okx' && !form.passphrase?.trim()) { setError('Passphrase is required for OKX'); return; }
     if (form.exchange === 'uniswap' && !(form as any).rpcUrl?.trim()) { setError('RPC URL is required for Uniswap'); return; }
     setSaving(true);
@@ -418,7 +418,7 @@ const ExchangeTab: FunctionComponent = () => {
                   <Input type="password" value={form.apiSecret ?? ''} 
                     placeholder={
                       (form.exchange === 'hyperliquid' || form.exchange === 'uniswap')
-                        ? '0x... private key (hex)'
+                        ? '0x... private key (hex). For Uniswap Safe multisig, use comma-separated owner keys'
                         : 'Paste your API secret'
                     }
                     onChange={(e) => upd({ apiSecret: e.target.value })} />
@@ -439,6 +439,13 @@ const ExchangeTab: FunctionComponent = () => {
                 )}
                 {form.exchange === 'uniswap' && (
                   <>
+                    <FormGroup $span={2}>
+                      <Label>Wallet Address</Label>
+                      <p style={{ margin: '0.1rem 0 0', color: '#7e8b99', fontSize: '0.78rem' }}>
+                        Use an EOA wallet for single-key swaps, or a Safe multisig contract address. For multisig execution,
+                        provide enough owner private keys in the Private Key field (comma-separated) to satisfy the Safe threshold.
+                      </p>
+                    </FormGroup>
                     <FormGroup $span={2}>
                       <Label>RPC URL <span style={{ color: '#d0616e' }}>*</span> (Infura / Alchemy endpoint)</Label>
                       <Input value={(form as any).rpcUrl ?? ''} placeholder="https://mainnet.infura.io/v3/YOUR_KEY"
@@ -1876,4 +1883,3 @@ const Settings: FunctionComponent = () => {
 };
 
 export default Settings;
-

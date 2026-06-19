@@ -38,6 +38,7 @@ export interface Account {
   rpcUrl?: string;
   chainId?: number;
   apiKey: string;
+  /** DeFi: private key; Uniswap Safe multisig supports comma-separated owner keys */
   apiSecret: string;
   /** Required for OKX */
   passphrase?: string;

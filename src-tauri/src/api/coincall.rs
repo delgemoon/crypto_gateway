@@ -1112,6 +1112,33 @@ pub async fn get_transaction_log(
     start_ms: i64,
     end_ms: i64,
 ) -> Result<Vec<TransactionLog>, String> {
+    const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
+    let requested_end = if end_ms > 0 { end_ms } else { now_ms() as i64 };
+    let requested_start = if start_ms > 0 { start_ms } else { requested_end - SEVEN_DAYS_MS };
+    let normalized_start = requested_start.min(requested_end);
+
+    let mut logs: Vec<TransactionLog> = Vec::new();
+    let mut window_start = normalized_start;
+    while window_start <= requested_end {
+        // ponytail: fixed-size 7-day windows; add concurrent fetch if this becomes slow.
+        let window_end = (window_start + SEVEN_DAYS_MS - 1).min(requested_end);
+        let mut chunk = get_transaction_log_window(account, window_start, window_end).await?;
+        logs.append(&mut chunk);
+        if window_end == requested_end {
+            break;
+        }
+        window_start = window_end + 1;
+    }
+
+    Ok(logs)
+}
+
+async fn get_transaction_log_window(
+    account: &Account,
+    start_ms: i64,
+    end_ms: i64,
+) -> Result<Vec<TransactionLog>, String> {
     let base_url = base(account.testnet);
     let client = Client::new();
     let mut logs: Vec<TransactionLog> = Vec::new();
@@ -1214,6 +1241,7 @@ pub async fn get_transaction_log(
                         Ok(r) => r.json().await.unwrap_or(Value::Null),
                         Err(_) => break,
                     };
+                eprintln!("[coincall] futures trade history resp: {}", serde_json::to_string(&resp).unwrap_or_default());
                 if resp["code"].as_i64() != Some(0) { break; }
 
                 let list = match resp["data"]["list"].as_array() {
@@ -1772,4 +1800,3 @@ async fn fetch_account_totals(account: &Account) -> Result<(f64, f64), String> {
 
     Ok((parse("equity"), parse("totalDollarValue")))
 }
-

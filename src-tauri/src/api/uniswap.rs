@@ -15,6 +15,7 @@
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use std::cmp::Ordering;
 use reqwest::Client;
 use serde_json::{json, Value};
 use sha3::{Digest, Keccak256};
@@ -55,7 +56,6 @@ fn token_registry() -> &'static HashMap<&'static str, TokenInfo> {
 
 const QUOTER_V2:  &str = "0x61fFE014bA17989E743c5F6cB21bF9697530B21e";
 const ROUTER_V2:  &str = "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45";
-
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
@@ -79,10 +79,28 @@ fn wallet_address(private_key_hex: &str) -> Result<String, String> {
     Ok(format!("0x{}", hex::encode(&hash[12..])))
 }
 
+fn split_private_keys(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c == ';' || c == '\n' || c == '\r')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
 fn keccak256(data: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(data);
     h.finalize().into()
+}
+
+fn sign_hash_65(private_key_hex: &str, hash: &[u8; 32]) -> Result<[u8; 65], String> {
+    let key = signing_key(private_key_hex)?;
+    let (sig, recid) = key.sign_prehash(hash).map_err(|e| format!("Sign error: {}", e))?;
+    let sig_bytes = sig.to_bytes();
+    let mut out = [0u8; 65];
+    out[..64].copy_from_slice(&sig_bytes);
+    out[64] = recid.to_byte().saturating_add(27);
+    Ok(out)
 }
 
 /// Sign an EIP-1559 transaction
@@ -209,9 +227,34 @@ fn abi_encode_u256(n: u128) -> Vec<u8> {
     out
 }
 
+fn abi_encode_u64_as_u256(n: u64) -> Vec<u8> {
+    let mut out = vec![0u8; 32];
+    out[24..].copy_from_slice(&n.to_be_bytes());
+    out
+}
+
+fn abi_encode_usize_as_u256(n: usize) -> Vec<u8> {
+    abi_encode_u256(n as u128)
+}
+
+fn abi_encode_bytes32(b: &[u8; 32]) -> Vec<u8> {
+    b.to_vec()
+}
+
 fn abi_encode_u24(n: u32) -> Vec<u8> {
     let mut out = vec![0u8; 32];
     out[29..].copy_from_slice(&n.to_be_bytes()[1..]);
+    out
+}
+
+fn abi_encode_bytes_dynamic(data: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&abi_encode_usize_as_u256(data.len()));
+    out.extend_from_slice(data);
+    let pad = (32 - (data.len() % 32)) % 32;
+    if pad > 0 {
+        out.extend_from_slice(&vec![0u8; pad]);
+    }
     out
 }
 
@@ -245,6 +288,11 @@ async fn eth_get_nonce(client: &Client, rpc_url: &str, address: &str) -> Result<
     u64::from_str_radix(hex_str.trim_start_matches("0x"), 16).map_err(|e| e.to_string())
 }
 
+async fn eth_get_code(client: &Client, rpc_url: &str, address: &str) -> Result<String, String> {
+    let result = rpc_call(client, rpc_url, "eth_getCode", json!([address, "latest"])).await?;
+    Ok(result.as_str().unwrap_or("0x").to_string())
+}
+
 async fn eth_gas_price(client: &Client, rpc_url: &str) -> Result<(u64, u64), String> {
     let fee_data = rpc_call(client, rpc_url, "eth_feeHistory", json!([1, "latest", [50]])).await?;
     let base = fee_data["baseFeePerGas"].as_array()
@@ -260,6 +308,88 @@ async fn eth_gas_price(client: &Client, rpc_url: &str) -> Result<(u64, u64), Str
 async fn eth_send_raw(client: &Client, rpc_url: &str, raw_tx: &str) -> Result<String, String> {
     let result = rpc_call(client, rpc_url, "eth_sendRawTransaction", json!([raw_tx])).await?;
     Ok(result.as_str().unwrap_or("").to_string())
+}
+
+async fn safe_get_u64(client: &Client, rpc_url: &str, safe_addr: &str, fn_sig: &str) -> Result<u64, String> {
+    let selector = &keccak256(fn_sig.as_bytes())[..4];
+    let data_hex = format!("0x{}", hex::encode(selector));
+    let result = eth_call(client, rpc_url, safe_addr, &data_hex).await?;
+    let bytes = hex::decode(result.trim_start_matches("0x")).map_err(|e| e.to_string())?;
+    if bytes.len() < 32 {
+        return Err(format!("Invalid Safe response for {}", fn_sig));
+    }
+    let mut n = [0u8; 8];
+    n.copy_from_slice(&bytes[24..32]);
+    Ok(u64::from_be_bytes(n))
+}
+
+fn safe_tx_hash(
+    chain_id: u64,
+    safe_addr: &str,
+    to: &str,
+    data: &[u8],
+    nonce: u64,
+) -> Result<[u8; 32], String> {
+    let safe_domain_typehash = keccak256(b"EIP712Domain(uint256 chainId,address verifyingContract)");
+    let safe_tx_typehash = keccak256(
+        b"SafeTx(address to,uint256 value,bytes data,uint8 operation,uint256 safeTxGas,uint256 baseGas,uint256 gasPrice,address gasToken,address refundReceiver,uint256 nonce)"
+    );
+
+    let mut domain = Vec::with_capacity(96);
+    domain.extend_from_slice(&safe_domain_typehash);
+    domain.extend_from_slice(&abi_encode_u64_as_u256(chain_id));
+    domain.extend_from_slice(&abi_encode_address(safe_addr));
+    let domain_hash = keccak256(&domain);
+
+    let data_hash = keccak256(data);
+    let mut tx = Vec::with_capacity(352);
+    tx.extend_from_slice(&safe_tx_typehash);
+    tx.extend_from_slice(&abi_encode_address(to));
+    tx.extend_from_slice(&abi_encode_u256(0)); // value
+    tx.extend_from_slice(&abi_encode_bytes32(&data_hash));
+    tx.extend_from_slice(&abi_encode_u256(0)); // operation = call
+    tx.extend_from_slice(&abi_encode_u256(0)); // safeTxGas
+    tx.extend_from_slice(&abi_encode_u256(0)); // baseGas
+    tx.extend_from_slice(&abi_encode_u256(0)); // gasPrice
+    tx.extend_from_slice(&abi_encode_address("0x0000000000000000000000000000000000000000")); // gasToken
+    tx.extend_from_slice(&abi_encode_address("0x0000000000000000000000000000000000000000")); // refundReceiver
+    tx.extend_from_slice(&abi_encode_u64_as_u256(nonce));
+    let tx_hash = keccak256(&tx);
+
+    let mut digest = Vec::with_capacity(66);
+    digest.extend_from_slice(&[0x19, 0x01]);
+    digest.extend_from_slice(&domain_hash);
+    digest.extend_from_slice(&tx_hash);
+    Ok(keccak256(&digest))
+}
+
+fn safe_exec_transaction_calldata(
+    to: &str,
+    data: &[u8],
+    signatures: &[u8],
+) -> Vec<u8> {
+    let selector = &keccak256(b"execTransaction(address,uint256,bytes,uint8,uint256,uint256,uint256,address,address,bytes)")[..4];
+    let head_words = 10usize;
+    let data_offset = 32 * head_words;
+    let data_segment = abi_encode_bytes_dynamic(data);
+    let sig_offset = data_offset + data_segment.len();
+    let sig_segment = abi_encode_bytes_dynamic(signatures);
+
+    let mut out = Vec::with_capacity(4 + head_words * 32 + data_segment.len() + sig_segment.len());
+    out.extend_from_slice(selector);
+    out.extend_from_slice(&abi_encode_address(to));
+    out.extend_from_slice(&abi_encode_u256(0)); // value
+    out.extend_from_slice(&abi_encode_usize_as_u256(data_offset));
+    out.extend_from_slice(&abi_encode_u256(0)); // operation = call
+    out.extend_from_slice(&abi_encode_u256(0)); // safeTxGas
+    out.extend_from_slice(&abi_encode_u256(0)); // baseGas
+    out.extend_from_slice(&abi_encode_u256(0)); // gasPrice
+    out.extend_from_slice(&abi_encode_address("0x0000000000000000000000000000000000000000")); // gasToken
+    out.extend_from_slice(&abi_encode_address("0x0000000000000000000000000000000000000000")); // refundReceiver
+    out.extend_from_slice(&abi_encode_usize_as_u256(sig_offset));
+    out.extend_from_slice(&data_segment);
+    out.extend_from_slice(&sig_segment);
+    out
 }
 
 // ── Token/pair parsing ─────────────────────────────────────────────────────
@@ -375,38 +505,92 @@ pub async fn place_order(req: &PlaceOrderRequest, account: &Account) -> Result<O
         (&token_in, &token_out)
     };
 
-    let from_addr = wallet_address(&account.api_secret)?;
-    let nonce = eth_get_nonce(&client, rpc_url, &from_addr).await?;
-    let (max_fee, max_tip) = eth_gas_price(&client, rpc_url).await?;
+    let signer_keys = split_private_keys(&account.api_secret);
+    if signer_keys.is_empty() {
+        return Err("No signer private key provided".to_string());
+    }
 
+    let key_addr = wallet_address(&signer_keys[0])?;
+    let account_addr = account.api_key.trim();
+    let is_contract_wallet = if account_addr.starts_with("0x") {
+        let code = eth_get_code(&client, rpc_url, account_addr).await?;
+        !(code.eq_ignore_ascii_case("0x") || code.eq_ignore_ascii_case("0x0"))
+    } else {
+        false
+    };
+
+    let swap_recipient = if is_contract_wallet { account_addr } else { &key_addr };
     let amount_in_raw = (req.amount * 10f64.powi(from_token.decimals as i32)) as u128;
     let deadline = now_ms() / 1000 + 1800; // 30 min
 
     // Build exactInputSingle calldata
-    // function exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))
-    let fn_selector = &keccak256(b"exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))")[..4];
+    // function exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))
+    let fn_selector = &keccak256(b"exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))")[..4];
     let mut calldata = fn_selector.to_vec();
     calldata.extend_from_slice(&abi_encode_address(from_token.address));
     calldata.extend_from_slice(&abi_encode_address(to_token.address));
     calldata.extend_from_slice(&abi_encode_u24(3000));
-    calldata.extend_from_slice(&abi_encode_address(&from_addr));
+    calldata.extend_from_slice(&abi_encode_address(swap_recipient));
     calldata.extend_from_slice(&abi_encode_u256(deadline as u128));
     calldata.extend_from_slice(&abi_encode_u256(amount_in_raw));
     // amountOutMinimum = 0 (no slippage protection - could be configurable)
     calldata.extend_from_slice(&abi_encode_u256(0));
     calldata.extend_from_slice(&abi_encode_u256(0)); // sqrtPriceLimitX96
 
-    let raw_tx = sign_tx(
-        ROUTER_V2,
-        &calldata,
-        0, // value = 0 for ERC-20 swaps
-        300_000, // gas limit
-        max_fee,
-        max_tip,
-        nonce,
-        chain_id,
-        &account.api_secret,
-    )?;
+    let (max_fee, max_tip) = eth_gas_price(&client, rpc_url).await?;
+    let raw_tx = if is_contract_wallet {
+        let safe_addr = account_addr;
+
+        let threshold = safe_get_u64(&client, rpc_url, safe_addr, "getThreshold()").await?;
+        if signer_keys.len() < threshold as usize {
+            return Err(format!(
+                "Safe requires {} signatures but only {} key(s) were provided",
+                threshold,
+                signer_keys.len()
+            ));
+        }
+
+        let safe_nonce = safe_get_u64(&client, rpc_url, safe_addr, "nonce()").await?;
+        let tx_hash = safe_tx_hash(chain_id, safe_addr, ROUTER_V2, &calldata, safe_nonce)?;
+
+        let mut sig_entries: Vec<(String, [u8; 65])> = Vec::new();
+        for key in signer_keys.iter().take(threshold as usize) {
+            let owner_addr = wallet_address(key)?;
+            let sig = sign_hash_65(key, &tx_hash)?;
+            sig_entries.push((owner_addr.to_ascii_lowercase(), sig));
+        }
+        sig_entries.sort_by(|a, b| {
+            if a.0 < b.0 { Ordering::Less } else if a.0 > b.0 { Ordering::Greater } else { Ordering::Equal }
+        });
+        let signatures: Vec<u8> = sig_entries.into_iter().flat_map(|(_, s)| s).collect();
+        let exec_data = safe_exec_transaction_calldata(ROUTER_V2, &calldata, &signatures);
+
+        let nonce = eth_get_nonce(&client, rpc_url, &key_addr).await?;
+        sign_tx(
+            safe_addr,
+            &exec_data,
+            0,
+            700_000,
+            max_fee,
+            max_tip,
+            nonce,
+            chain_id,
+            &signer_keys[0],
+        )?
+    } else {
+        let nonce = eth_get_nonce(&client, rpc_url, &key_addr).await?;
+        sign_tx(
+            ROUTER_V2,
+            &calldata,
+            0, // value = 0 for ERC-20 swaps
+            300_000, // gas limit
+            max_fee,
+            max_tip,
+            nonce,
+            chain_id,
+            &signer_keys[0],
+        )?
+    };
 
     let tx_hash = eth_send_raw(&client, rpc_url, &raw_tx).await?;
     let order_id = tx_hash.clone();
