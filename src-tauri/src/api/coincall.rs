@@ -77,7 +77,6 @@ fn cc_sign(
     } else {
         format!("{}{}?{}&{}", method, uri, sorted_user_params, auth)
     };
-    eprintln!("[coincall] prehash: {}", prehash);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(prehash.as_bytes());
     hex::encode(mac.finalize().into_bytes()).to_uppercase()
@@ -1112,17 +1111,17 @@ pub async fn get_transaction_log(
     start_ms: i64,
     end_ms: i64,
 ) -> Result<Vec<TransactionLog>, String> {
-    const SEVEN_DAYS_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+    const THIRTY_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1000;
 
     let requested_end = if end_ms > 0 { end_ms } else { now_ms() as i64 };
-    let requested_start = if start_ms > 0 { start_ms } else { requested_end - SEVEN_DAYS_MS };
+    let requested_start = if start_ms > 0 { start_ms } else { requested_end - THIRTY_DAYS_MS };
     let normalized_start = requested_start.min(requested_end);
 
     let mut logs: Vec<TransactionLog> = Vec::new();
     let mut window_start = normalized_start;
     while window_start <= requested_end {
-        // ponytail: fixed-size 7-day windows; add concurrent fetch if this becomes slow.
-        let window_end = (window_start + SEVEN_DAYS_MS - 1).min(requested_end);
+        // ponytail: fixed-size 30-day windows; add concurrent fetch if this becomes slow.
+        let window_end = (window_start + THIRTY_DAYS_MS - 1).min(requested_end);
         let mut chunk = get_transaction_log_window(account, window_start, window_end).await?;
         logs.append(&mut chunk);
         if window_end == requested_end {
@@ -1131,6 +1130,7 @@ pub async fn get_transaction_log(
         window_start = window_end + 1;
     }
 
+    logs.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     Ok(logs)
 }
 
@@ -1241,7 +1241,6 @@ async fn get_transaction_log_window(
                         Ok(r) => r.json().await.unwrap_or(Value::Null),
                         Err(_) => break,
                     };
-                eprintln!("[coincall] futures trade history resp: {}", serde_json::to_string(&resp).unwrap_or_default());
                 if resp["code"].as_i64() != Some(0) { break; }
 
                 let list = match resp["data"]["list"].as_array() {
@@ -1329,32 +1328,65 @@ async fn get_transaction_log_window(
                                     .unwrap_or_default();
                     let fee_ccy = t["feeCurrency"].as_str().unwrap_or("").to_string();
                     let symbol  = t["symbol"].as_str().unwrap_or("");
-                    // For spot, currency is the base coin (extracted from feeCurrency or symbol)
-                    let base_ccy = if !fee_ccy.is_empty() { fee_ccy.clone() } else { symbol.to_string() };
                     let side = if t["tradeSide"].as_i64().unwrap_or(1) == 1 { "buy" } else { "sell" };
                     let (base_currency, quote_currency) = parse_base_quote(symbol);
+                    let qty = t["qty"].as_f64().or_else(|| t["qty"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0);
+                    let px = t["price"].as_f64().or_else(|| t["price"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0);
+                    let fee = t["fee"].as_f64().or_else(|| t["fee"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0);
+                    let notional = qty * px;
+                    let is_buy = side == "buy";
+                    let base_change = if is_buy { qty } else { -qty };
+                    let quote_change = if is_buy { -notional } else { notional };
+
                     logs.push(TransactionLog {
-                        id:                 trade_id.clone(),
+                        id:                 format!("{}-base", trade_id),
                         timestamp:          ts,
                         instrument_name:    symbol.to_string(),
                         transaction_type:   "trade".to_string(),
                         category:           String::new(),
                         side:               side.to_string(),
-                        amount:             t["qty"].as_f64().or_else(|| t["qty"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0),
-                        price:              t["price"].as_f64().or_else(|| t["price"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0),
-                        fee:                t["fee"].as_f64().or_else(|| t["fee"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0),
-                        fee_currency:       fee_ccy,
-                        currency:           base_ccy,
+                        amount:             qty,
+                        price:              px,
+                        fee:                if fee_ccy == base_currency { fee } else { 0.0 },
+                        fee_currency:       fee_ccy.clone(),
+                        currency:           base_currency.clone(),
                         profit_as_cashflow: 0.0,
                         balance:            0.0,
-                        change:             0.0,
+                        change:             base_change,
+                        trade_id:           trade_id.clone(),
+                        order_id:           order_id.clone(),
+                        info:               String::new(),
+                        mark_price:         0.0,
+                        index_price:        0.0,
+                        equity:             0.0,
+                        position:           notional,
+                        base_currency:      base_currency.clone(),
+                        quote_currency:     quote_currency.clone(),
+                        funding:            0.0,
+                    });
+                    logs.push(TransactionLog {
+                        id:                 format!("{}-quote", trade_id),
+                        timestamp:          ts,
+                        instrument_name:    symbol.to_string(),
+                        transaction_type:   "trade".to_string(),
+                        category:           String::new(),
+                        side:               side.to_string(),
+                        amount:             notional,
+                        price:              px,
+                        // ponytail: if fee currency is neither leg, keep it on quote leg until fee-leg support is needed.
+                        fee:                if fee_ccy == quote_currency || (fee_ccy != base_currency && fee_ccy != quote_currency) { fee } else { 0.0 },
+                        fee_currency:       fee_ccy.clone(),
+                        currency:           quote_currency.clone(),
+                        profit_as_cashflow: 0.0,
+                        balance:            0.0,
+                        change:             quote_change,
                         trade_id,
                         order_id,
                         info:               String::new(),
                         mark_price:         0.0,
                         index_price:        0.0,
                         equity:             0.0,
-                        position:           t["qty"].as_f64().or_else(|| t["qty"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0) * t["price"].as_f64().or_else(|| t["price"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0.0),
+                        position:           notional,
                         base_currency,
                         quote_currency,
                         funding:            0.0,
@@ -1462,7 +1494,7 @@ async fn get_transaction_log_window(
                     Ok(r) => r.json().await.unwrap_or(Value::Null),
                     Err(_) => break,
                 };
-
+            eprintln!("[coincall] sysTransferRecords resp: {}", serde_json::to_string(&resp).unwrap_or_default());
             if resp["code"].as_i64() != Some(0) { break; }
 
             let list = match resp["data"]["list"].as_array() {
@@ -1546,6 +1578,7 @@ async fn get_transaction_log_window(
                     Ok(r) => r.json().await.unwrap_or(Value::Null),
                     Err(_) => break,
                 };
+            eprintln!("[coincall] funding record resp: {}", serde_json::to_string(&resp).unwrap_or_default());
             if resp["code"].as_i64() != Some(0) { break; }
             let list = match resp["data"]["list"].as_array() {
                 Some(l) if !l.is_empty() => l.clone(),
@@ -1556,9 +1589,22 @@ async fn get_transaction_log_window(
                 if ts < start_ms || ts > end_ms { continue; }
                 let id = e["id"].as_i64().map(|n| n.to_string()).unwrap_or_default();
                 let symbol = e["symbol"].as_str().unwrap_or("").to_string();
-                let fund_fee = e["fundFee"].as_f64().unwrap_or(0.0);
-                let fund_rate = e["fundRate"].as_f64().unwrap_or(0.0);
-                let side = if e["tradeSide"].as_i64().unwrap_or(1) == 1 { "buy" } else { "sell" };
+                let mut fund_fee = e["fundFee"].as_f64()
+                    .or_else(|| e["fundFee"].as_str().and_then(|s| s.parse().ok()))
+                    .unwrap_or(0.0);
+                let fund_rate = e["fundRate"].as_f64()
+                    .or_else(|| e["fundRate"].as_str().and_then(|s| s.parse().ok()))
+                    .unwrap_or(0.0);
+                let trade_side = e["tradeSide"].as_i64().unwrap_or(1);
+                let side = if trade_side == 1 { "buy" } else { "sell" };
+                if fund_fee > 0.0 && fund_rate != 0.0 {
+                    let is_long = trade_side == 1;
+                    // ponytail: if API sends absolute fundFee, derive cashflow sign from side+rate.
+                    let receives = (is_long && fund_rate < 0.0) || (!is_long && fund_rate > 0.0);
+                    if !receives {
+                        fund_fee = -fund_fee;
+                    }
+                }
                 let (base_currency, quote_currency) = parse_base_quote(&symbol);
                 logs.push(TransactionLog {
                     id,
@@ -1584,7 +1630,7 @@ async fn get_transaction_log_window(
                     position:           0.0,
                     base_currency,
                     quote_currency,
-                    funding:            0.0,
+                    funding:            fund_fee,
                 });
             }
             let total: u32 = resp["data"]["total"].as_u64().unwrap_or(0) as u32;
@@ -1612,6 +1658,7 @@ async fn get_transaction_log_window(
                     Ok(r) => r.json().await.unwrap_or(Value::Null),
                     Err(_) => break,
                 };
+            eprintln!("[coincall] futures delivery settlement resp: {}", serde_json::to_string(&resp).unwrap_or_default());
             if resp["code"].as_i64() != Some(0) { break; }
             let list = match resp["data"]["list"].as_array() {
                 Some(l) if !l.is_empty() => l.clone(),
@@ -1634,7 +1681,7 @@ async fn get_transaction_log_window(
                     id:                 format!("settle-{}-{}", symbol, ts),
                     timestamp:          ts,
                     instrument_name:    symbol,
-                    transaction_type:   "delivery".to_string(),
+                    transaction_type:   "settlement".to_string(),
                     category:           String::new(),
                     side:               side.to_string(),
                     amount:             qty,
@@ -1682,13 +1729,13 @@ async fn get_transaction_log_window(
                     Ok(r) => r.json().await.unwrap_or(Value::Null),
                     Err(_) => break,
                 };
+            eprintln!("[coincall] options exercise records resp: {}", serde_json::to_string(&resp).unwrap_or_default());
             if resp["code"].as_i64() != Some(0) { break; }
             let list = match resp["data"]["list"].as_array() {
                 Some(l) if !l.is_empty() => l.clone(),
                 _ => break,
             };
             for e in &list {
-                eprintln!("Debug: raw exercise record: {}", e);
                 let ts = e["exerciseTime"].as_i64()
                     .or_else(|| e["ctime"].as_i64())
                     .or_else(|| e["time"].as_i64())
@@ -1755,8 +1802,8 @@ async fn get_transaction_log_window(
     logs.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
 
     // ── Backward balance + equity reconstruction ─────────────────────────────
-    // equity  = top-level `equity`           from /open/account/summary/v1
-    // balance = top-level `totalDollarValue` from /open/account/summary/v1
+    // equity  = top-level `equity` from /open/account/summary/v1
+    // balance = sum(accounts[*].cashBalance) (fallback: availableBalance)
     // Walk newest→oldest undoing each entry's `change` to reconstruct both.
     if let Ok((seed_equity, seed_balance)) = fetch_account_totals(account).await {
         let mut running_equity  = seed_equity;
@@ -1773,9 +1820,9 @@ async fn get_transaction_log_window(
     Ok(logs)
 }
 
-/// Fetch top-level account totals: (equity, totalDollarValue).
+/// Fetch account totals: (equity, summed cash balance from account list).
 /// `equity`          = account-level net equity in USD
-/// `totalDollarValue`= total wallet value in USD (used as "balance" seed)
+/// `balance`         = sum(accounts[*].cashBalance), with availableBalance fallback
 async fn fetch_account_totals(account: &Account) -> Result<(f64, f64), String> {
     let base_url = base(account.testnet);
     let uri = "/open/account/summary/v1";
@@ -1792,11 +1839,19 @@ async fn fetch_account_totals(account: &Account) -> Result<(f64, f64), String> {
     }
 
     let d = &resp["data"];
-    let parse = |key: &str| -> f64 {
-        d[key].as_f64()
-            .or_else(|| d[key].as_str().and_then(|s| s.parse().ok()))
+    let parse_num = |v: &Value| -> f64 {
+        v.as_f64()
+            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             .unwrap_or(0.0)
     };
 
-    Ok((parse("equity"), parse("totalDollarValue")))
+    let equity = parse_num(&d["equity"]);
+    let balance = d["accounts"].as_array()
+        .map(|accs| accs.iter().map(|a| {
+            let cash = parse_num(&a["cashBalance"]);
+            if cash != 0.0 { cash } else { parse_num(&a["availableBalance"]) }
+        }).sum::<f64>())
+        .unwrap_or_else(|| parse_num(&d["totalDollarValue"]));
+
+    Ok((equity, balance))
 }
